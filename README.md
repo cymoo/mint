@@ -18,7 +18,7 @@ A lightweight, type-safe Go web framework built on top of `net/http` with automa
 go get github.com/cymoo/mint
 ```
 
-**Requirements:** Go 1.22+ (for enhanced routing patterns)
+**Requirements:** Go 1.23+ (for enhanced routing patterns)
 
 ## 🚀 Quick Start
 
@@ -26,32 +26,57 @@ go get github.com/cymoo/mint
 package main
 
 import (
-    "net/http"
-    "github.com/cymoo/mint"
+	"net/http"
+
+	"github.com/cymoo/mint"
 )
 
 type User struct {
-    ID   int    `json:"id"`
-    Name string `json:"name"`
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+type UpdateUserRequest struct {
+	Name string `json:"name"`
+}
+
+// Simple string response
+func handleHome() string {
+	return "Hello, World!"
+}
+
+// JSON response with path parameter
+func handleGetUser(id m.Path[int]) (User, error) {
+	// id.Value contains the parsed integer
+	return User{ID: id.Value, Name: "Alice"}, nil
+}
+
+// Result[T] for full control over the response with multiple parameters with different types
+func handleUpdateUser(id m.Path[int], req m.JSON[UpdateUserRequest]) m.Result[*User] {
+	return m.Result[*User]{
+		Data: &User{ID: id.Value, Name: req.Value.Name},
+		Code: http.StatusOK,
+		Headers: http.Header{
+			"X-Custom-Header": []string{"foo"},
+		},
+	}
 }
 
 func main() {
-    mux := http.NewServeMux()
-    
-    // Simple string response
-    mux.HandleFunc("GET /", m.H(func() string {
-        return "Hello, World!"
-    }))
-    
-    // JSON response with path parameter
-    mux.HandleFunc("GET /users/{id}", m.H(func(id m.Path[int]) (User, error) {
-        // id.Value contains the parsed integer
-        return User{ID: id.Value, Name: "Alice"}, nil
-    }))
-    
-    http.ListenAndServe(":8080", mux)
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", m.H(handleHome))
+	mux.HandleFunc("GET /users/{id}", m.H(handleGetUser))
+	mux.HandleFunc("PUT /users/{id}", m.H(handleUpdateUser))
+
+	err := http.ListenAndServe(":8080", mux)
+	if err != nil {
+		panic(err)
+	}
 }
 ```
+
+See [_examples](./_examples/) for more detailed examples.
 
 ## 📚 Core Concepts
 
@@ -242,6 +267,63 @@ mux.HandleFunc("GET /custom", m.H(func(w http.ResponseWriter, r *http.Request) {
 }))
 ```
 
+## Custom Extractors Guide
+
+Custom extractors allow you to extend the framework to handle any type of request data. Here's how to create your own:
+
+### Basic Structure
+
+Implement the `Extractor` interface with an `Extract` method:
+
+```go
+type BearerToken struct {
+    Token string
+}
+
+func (bt *BearerToken) Extract(r *http.Request) error {
+    const bearerPrefix = "Bearer "
+    auth := r.Header.Get("Authorization")
+    
+    if strings.HasPrefix(auth, bearerPrefix) {
+        bt.Token = strings.TrimSpace(auth[len(bearerPrefix):])
+    }
+    
+    if bt.Token == "" {
+        return &m.ExtractError{
+            Type:    "invalid_authorization",
+            Message: "Authorization header must be: Bearer <token>",
+        }
+    }
+    
+    return nil
+}
+```
+
+### Key Features
+
+- **Automatic Injection**: The framework automatically calls `Extract()` and injects the parsed value
+- **Error Handling**: Return `ExtractError` with clear type and message for client errors
+- **Type Safety**: Leverage Go's type system for validated, type-safe parameters
+
+### Usage in Handlers
+
+Simply include your custom extractor as a handler parameter:
+
+```go
+func mySecureApi(bearer BearerToken) string {
+    return "token: " + bearer.Token
+}
+```
+
+### Best Practices
+
+- Keep extractors focused on single responsibility
+- Return meaningful error messages for client-side issues
+- Use `ExtractError` for consistent error handling
+- Validate and sanitize data within the extractor
+
+Custom extractors make your handlers cleaner by moving data extraction and validation logic to reusable components.
+
 ## ⚙️ Configuration
 
 Customize framework behavior globally:
@@ -430,12 +512,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## 📄 License
 
 MIT License - see [LICENSE](LICENSE) file for details
-
-## 🙏 Acknowledgments
-
-- Built on Go's standard `net/http` package
-- Uses [gorilla/schema](https://github.com/gorilla/schema) for form/query parsing
-
----
-
-**Made with ❤️ for the Go community**
