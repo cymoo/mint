@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github/cymoo/mint"
+	m "github.com/cymoo/mint"
 )
 
 // Domain models
@@ -109,16 +109,16 @@ func handleListUsers(q m.Query[UserQueryParams]) []User {
 }
 
 // 4. Path parameter extraction + error handling
-func handleGetUser(id m.Path[int]) (User, error) {
+func handleGetUser(id m.Path[int]) (*User, error) {
 	user, ok := users[id.Value]
 	if !ok {
-		return User{}, &m.HTTPError{
+		return nil, &m.HTTPError{
 			Code:    404,
 			Err:     "not_found",
 			Message: fmt.Sprintf("user %d not found", id.Value),
 		}
 	}
-	return user, nil
+	return &user, nil
 }
 
 // 5. JSON body extraction + Result with custom status and headers
