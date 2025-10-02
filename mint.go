@@ -82,7 +82,9 @@ func (c *Config) jsonEncode(w io.Writer, v any) error {
 		return err
 	}
 
-	return json.NewEncoder(w).Encode(v)
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(v)
 }
 
 func (c *Config) jsonUnmarshal(data []byte, v any) error {
