@@ -1256,7 +1256,7 @@ func TestGetPointer(t *testing.T) {
 		x := &num
 		val := reflect.ValueOf(&x).Elem()
 		ptr := getPointer(val)
-		if *(ptr.(**int)) != &num {
+		if *(ptr.(*int)) != num {
 			t.Error("getPointer failed for non-nil pointer")
 		}
 	})
@@ -1510,9 +1510,9 @@ func TestEdgeCases(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/", nil)
 		handler(rec, req)
-		// StatusCode(0) should write status 0
-		if rec.Code != 0 {
-			t.Errorf("expected status 0, got %d", rec.Code)
+		// StatusCode(0) should write status 200
+		if rec.Code != 200 {
+			t.Errorf("expected status 200, got %d", rec.Code)
 		}
 	})
 

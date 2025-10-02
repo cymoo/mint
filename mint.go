@@ -103,6 +103,7 @@ const (
 var (
 	extractorType = reflect.TypeOf((*Extractor)(nil)).Elem()
 	errorType     = reflect.TypeOf((*error)(nil)).Elem()
+	readerType    = reflect.TypeOf((*io.Reader)(nil)).Elem()
 
 	handlerType        = reflect.TypeOf((*http.Handler)(nil)).Elem()
 	responseWriterType = reflect.TypeOf((*http.ResponseWriter)(nil)).Elem()
@@ -310,6 +311,9 @@ func (rw *ResponseWriter) WriteHeader(code int) {
 		log.Printf("Warning: multiple calls to WriteHeader, original status code: %d, new status code: %d", rw.statusCode, code)
 		return
 	}
+	if code <= 0 {
+		code = 200
+	}
 	rw.statusCode = code
 	rw.headerWritten = true
 	rw.ResponseWriter.WriteHeader(code)
@@ -348,8 +352,8 @@ func H(fn any) http.HandlerFunc {
 	if numOut == 1 {
 		rt := fnType.Out(0)
 		if rt.Kind() == reflect.Interface {
-			if !rt.Implements(errorType) && !rt.Implements(handlerType) {
-				log.Panic("H: interface return type must implement error or http.Handler")
+			if !rt.Implements(errorType) && !rt.Implements(handlerType) && !rt.Implements(readerType) {
+				log.Panic("H: interface return type must implement error, http.Handler or io.Reader")
 			}
 		}
 	}
