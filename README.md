@@ -92,27 +92,27 @@ mux.HandleFunc("POST /users", m.H(handleCreateUser))
 
 Extract data from requests using type-safe extractors:
 
-| Extractor | Purpose | Example |
-|-----------|---------|---------|
-| `m.Path[T]` | Path parameters | `{id}` → `m.Path[int]` |
-| `m.JSON[T]` | JSON request body | `m.JSON[CreateUserRequest]` |
-| `m.Query[T]` | Query parameters | `?page=1` → `m.Query[Pagination]` |
-| `m.Form[T]` | Form data | `username=...` → `m.Form[LoginForm]` |
+| Extractor    | Purpose           | Example                              |
+| ------------ | ----------------- | ------------------------------------ |
+| `m.Path[T]`  | Path parameters   | `{id}` → `m.Path[int]`               |
+| `m.JSON[T]`  | JSON request body | `m.JSON[CreateUserRequest]`          |
+| `m.Query[T]` | Query parameters  | `?page=1` → `m.Query[Pagination]`    |
+| `m.Form[T]`  | Form data         | `username=...` → `m.Form[LoginForm]` |
 
 ### Response Types
 
 Return values are automatically handled:
 
-| Return Type | Result |
-|-------------|--------|
-| `string` | `text/plain` response |
-| `m.HTML` | `text/html` response |
-| `struct` / `map` / `slice` | `application/json` response |
-| `m.StatusCode` | HTTP status code only |
-| `[]byte` | `application/octet-stream` response |
-| `m.Result[T]` | Custom status code + headers + data |
-| `error` | Automatic error handling |
-| `(T, error)` | Data or error pattern |
+| Return Type                | Result                              |
+| -------------------------- | ----------------------------------- |
+| `string`                   | `text/plain` response               |
+| `m.HTML`                   | `text/html` response                |
+| `struct` / `map` / `slice` | `application/json` response         |
+| `m.StatusCode`             | HTTP status code only               |
+| `[]byte`                   | `application/octet-stream` response |
+| `m.Result[T]`              | Custom status code + headers + data |
+| `error`                    | Automatic error handling            |
+| `(T, error)`               | Data or error pattern               |
 
 ## 📖 Usage Examples
 

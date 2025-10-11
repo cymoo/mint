@@ -623,10 +623,6 @@ func handleError(w http.ResponseWriter, err error) error {
 		w.WriteHeader(httpErr.Code)
 	}
 
-	if httpErr.Code >= 500 {
-		log.Println(httpErr.Error())
-	}
-
 	return config.jsonEncode(w, httpErr)
 }
 
