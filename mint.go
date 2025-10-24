@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/gorilla/schema"
 )
 
@@ -33,6 +34,16 @@ type Config struct {
 	// JSONUnmarshalFunc for decoding JSON requests
 	// If nil, json.Unmarshal will be used
 	JSONUnmarshalFunc func(data []byte, v any) error
+
+	// Logger allows user to provide custom logger. If nil, log.Default() is used.
+	Logger *log.Logger
+
+	// Validate controls whether automatic validation is performed.
+	// If nil => default true. If set to pointer to false => validation disabled.
+	Validate *bool
+
+	// Validator is the go-playground validator instance. If nil, will be created on demand.
+	Validator *validator.Validate
 }
 
 var (
@@ -57,6 +68,32 @@ func getConfig() *Config {
 	configMu.RLock()
 	defer configMu.RUnlock()
 	return config
+}
+
+// logger returns the configured logger or the default logger.
+func (c *Config) logger() *log.Logger {
+	if c.Logger != nil {
+		return c.Logger
+	}
+	return log.Default()
+}
+
+// validateEnabled returns whether validation is enabled. Default: true
+func (c *Config) validateEnabled() bool {
+	if c.Validate == nil {
+		return true
+	}
+	return *c.Validate
+}
+
+// validator returns the configured validator or a new one.
+func (c *Config) validator() *validator.Validate {
+	if c.Validator != nil {
+		return c.Validator
+	}
+	v := validator.New()
+	c.Validator = v
+	return v
 }
 
 func (c *Config) schemaDecoder() *schema.Decoder {
@@ -194,7 +231,18 @@ func (j *JSON[T]) Extract(r *http.Request) error {
 
 	target := getPointer(val)
 
-	return getConfig().jsonUnmarshal(body, target)
+	if err := getConfig().jsonUnmarshal(body, target); err != nil {
+		return err
+	}
+
+	// validation if enabled
+	if getConfig().validateEnabled() {
+		if err := getConfig().validator().Struct(target); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 type Query[T any] struct {
@@ -205,7 +253,18 @@ func (q *Query[T]) Extract(r *http.Request) error {
 	val := reflect.ValueOf(&q.Value).Elem()
 
 	target := getPointer(val)
-	return getConfig().schemaDecoder().Decode(target, r.URL.Query())
+	if err := getConfig().schemaDecoder().Decode(target, r.URL.Query()); err != nil {
+		return err
+	}
+
+	// validation if enabled
+	if getConfig().validateEnabled() {
+		if err := getConfig().validator().Struct(target); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 type Form[T any] struct {
@@ -219,7 +278,18 @@ func (f *Form[T]) Extract(r *http.Request) error {
 
 	val := reflect.ValueOf(&f.Value).Elem()
 	target := getPointer(val)
-	return getConfig().schemaDecoder().Decode(target, r.Form)
+	if err := getConfig().schemaDecoder().Decode(target, r.Form); err != nil {
+		return err
+	}
+
+	// validation if enabled
+	if getConfig().validateEnabled() {
+		if err := getConfig().validator().Struct(target); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 type Path[T PathValue] struct {
@@ -310,7 +380,7 @@ type ResponseWriter struct {
 
 func (rw *ResponseWriter) WriteHeader(code int) {
 	if rw.headerWritten {
-		log.Printf("Warning: multiple calls to WriteHeader, original status code: %d, new status code: %d", rw.statusCode, code)
+		getConfig().logger().Printf("Warning: multiple calls to WriteHeader, original status code: %d, new status code: %d", rw.statusCode, code)
 		return
 	}
 	if code <= 0 {
@@ -401,7 +471,7 @@ func H(fn any) http.HandlerFunc {
 				if err := extractor.Extract(r); err != nil {
 					e := handleError(rw, err)
 					if e != nil {
-						log.Printf("failed to write error response: %v", e)
+						getConfig().logger().Printf("failed to write error response: %v", e)
 					}
 					return
 				}
@@ -437,7 +507,7 @@ func H(fn any) http.HandlerFunc {
 
 			err := handleOneResult(rw, rv)
 			if err != nil {
-				log.Printf("failed to write response: %v", err)
+				getConfig().logger().Printf("failed to write response: %v", err)
 			}
 		}
 
@@ -451,7 +521,7 @@ func H(fn any) http.HandlerFunc {
 
 			e := handleTwoResults(rw, rv, err)
 			if e != nil {
-				log.Printf("failed to write response: %v", e)
+				getConfig().logger().Printf("failed to write response: %v", e)
 			}
 		}
 	}
@@ -687,6 +757,20 @@ func toHTTPError(err error) *HTTPError {
 		}
 	}
 
+	// handle validator.ValidationErrors
+	var ve validator.ValidationErrors
+	if errors.As(err, &ve) {
+		parts := make([]string, 0, len(ve))
+		for _, ferr := range ve {
+			parts = append(parts, fmt.Sprintf("%s: %s", ferr.StructNamespace(), ferr.Tag()))
+		}
+		return &HTTPError{
+			Code:    400,
+			Err:     "validation_failed",
+			Message: strings.Join(parts, "; "),
+		}
+	}
+
 	switch e := err.(type) {
 	case *json.UnmarshalTypeError:
 		return &HTTPError{
@@ -778,14 +862,14 @@ func extractPatternNames(pattern string) []string {
 	for i, char := range pattern {
 		if char == '{' {
 			if inParam {
-				log.Printf("warning: nested braces at position %d in pattern %q", i, pattern)
+				getConfig().logger().Printf("warning: nested braces at position %d in pattern %q", i, pattern)
 			}
 			inParam = true
 			depth++
 			currentName = ""
 		} else if char == '}' {
 			if !inParam {
-				log.Printf("warning: unmatched closing brace at position %d in pattern %q", i, pattern)
+				getConfig().logger().Printf("warning: unmatched closing brace at position %d in pattern %q", i, pattern)
 				continue
 			}
 			inParam = false
@@ -799,7 +883,7 @@ func extractPatternNames(pattern string) []string {
 	}
 
 	if depth != 0 {
-		log.Printf("warning: unbalanced braces in pattern %q", pattern)
+		getConfig().logger().Printf("warning: unbalanced braces in pattern %q", pattern)
 	}
 
 	return names
