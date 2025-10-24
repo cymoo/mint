@@ -38,11 +38,12 @@ type Config struct {
 	// Logger allows user to provide custom logger. If nil, log.Default() is used.
 	Logger *log.Logger
 
-	// Validate controls whether automatic validation is performed.
-	// If nil => default true. If set to pointer to false => validation disabled.
-	Validate *bool
+	// EnableValidation enables automatic validation for JSON, Query, and Form extractors
+	// Default: true
+	EnableValidation bool
 
-	// Validator is the go-playground validator instance. If nil, will be created on demand.
+	// Validator is the validation instance to use
+	// If nil and EnableValidation is true, a default validator will be created
 	Validator *validator.Validate
 }
 
@@ -59,7 +60,27 @@ func SetConfig(cfg *Config) {
 	configMu.Lock()
 	defer configMu.Unlock()
 	if cfg == nil {
-		cfg = &Config{}
+		cfg = &Config{EnableValidation: true}
+	}
+	// Enable validation by default
+	if cfg.Validator == nil && cfg.EnableValidation {
+		cfg.Validator = validator.New()
+		// Use json tag as field name for validation errors
+		cfg.Validator.RegisterTagNameFunc(func(fld reflect.StructField) string {
+			name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
+			if name == "-" {
+				return ""
+			}
+			if name != "" {
+				return name
+			}
+			// Fallback to form tag
+			name = strings.SplitN(fld.Tag.Get("form"), ",", 2)[0]
+			if name == "-" {
+				return ""
+			}
+			return name
+		})
 	}
 	config = cfg
 }
@@ -76,24 +97,6 @@ func (c *Config) logger() *log.Logger {
 		return c.Logger
 	}
 	return log.Default()
-}
-
-// validateEnabled returns whether validation is enabled. Default: true
-func (c *Config) validateEnabled() bool {
-	if c.Validate == nil {
-		return true
-	}
-	return *c.Validate
-}
-
-// validator returns the configured validator or a new one.
-func (c *Config) validator() *validator.Validate {
-	if c.Validator != nil {
-		return c.Validator
-	}
-	v := validator.New()
-	c.Validator = v
-	return v
 }
 
 func (c *Config) schemaDecoder() *schema.Decoder {
@@ -131,12 +134,21 @@ func (c *Config) jsonUnmarshal(data []byte, v any) error {
 	return c.JSONUnmarshalFunc(data, v)
 }
 
+func (c *Config) validate(v any) error {
+	c.logger().Printf("Validating value of type %T", v)
+	if !c.EnableValidation || c.Validator == nil {
+		return nil
+	}
+	return c.Validator.Struct(v)
+}
+
 const (
 	ErrTypeBodyRead       = "body_read_error"
 	ErrTypeEmptyBody      = "empty_body"
 	ErrTypeFormParse      = "form_parse_error"
 	ErrTypePathConversion = "path_conversion_error"
 	ErrTypeMissingPath    = "missing_path_value"
+	ErrTypeValidation     = "validation_error"
 )
 
 var (
@@ -235,11 +247,8 @@ func (j *JSON[T]) Extract(r *http.Request) error {
 		return err
 	}
 
-	// validation if enabled
-	if getConfig().validateEnabled() {
-		if err := getConfig().validator().Struct(target); err != nil {
-			return err
-		}
+	if err := getConfig().validate(target); err != nil {
+		return NewValidationError(err)
 	}
 
 	return nil
@@ -257,11 +266,8 @@ func (q *Query[T]) Extract(r *http.Request) error {
 		return err
 	}
 
-	// validation if enabled
-	if getConfig().validateEnabled() {
-		if err := getConfig().validator().Struct(target); err != nil {
-			return err
-		}
+	if err := getConfig().validate(target); err != nil {
+		return NewValidationError(err)
 	}
 
 	return nil
@@ -282,11 +288,8 @@ func (f *Form[T]) Extract(r *http.Request) error {
 		return err
 	}
 
-	// validation if enabled
-	if getConfig().validateEnabled() {
-		if err := getConfig().validator().Struct(target); err != nil {
-			return err
-		}
+	if err := getConfig().validate(target); err != nil {
+		return NewValidationError(err)
 	}
 
 	return nil
@@ -576,6 +579,79 @@ func NewMissingPathError(field string) error {
 	}
 }
 
+func NewValidationError(err error) error {
+	return &ExtractError{
+		Type:    ErrTypeValidation,
+		Message: formatValidationError(err),
+		Err:     err,
+	}
+}
+
+// formatValidationError formats validation errors into user-friendly messages
+func formatValidationError(err error) string {
+	var ve validator.ValidationErrors
+	if !errors.As(err, &ve) {
+		return err.Error()
+	}
+
+	if len(ve) == 0 {
+		return "validation failed"
+	}
+
+	messages := make([]string, 0, len(ve))
+	for _, fe := range ve {
+		field := fe.Field()
+		if field == "" {
+			field = fe.StructField()
+		}
+
+		msg := formatFieldError(field, fe)
+		messages = append(messages, msg)
+	}
+
+	return strings.Join(messages, "; ")
+}
+
+// formatFieldError formats a single field validation error
+func formatFieldError(field string, fe validator.FieldError) string {
+	switch fe.Tag() {
+	case "required":
+		return fmt.Sprintf("%s is required", field)
+	case "email":
+		return fmt.Sprintf("%s must be a valid email address", field)
+	case "min":
+		return fmt.Sprintf("%s must be at least %s", field, fe.Param())
+	case "max":
+		return fmt.Sprintf("%s must be at most %s", field, fe.Param())
+	case "len":
+		return fmt.Sprintf("%s must be %s characters long", field, fe.Param())
+	case "gt":
+		return fmt.Sprintf("%s must be greater than %s", field, fe.Param())
+	case "gte":
+		return fmt.Sprintf("%s must be greater than or equal to %s", field, fe.Param())
+	case "lt":
+		return fmt.Sprintf("%s must be less than %s", field, fe.Param())
+	case "lte":
+		return fmt.Sprintf("%s must be less than or equal to %s", field, fe.Param())
+	case "oneof":
+		return fmt.Sprintf("%s must be one of [%s]", field, fe.Param())
+	case "url":
+		return fmt.Sprintf("%s must be a valid URL", field)
+	case "uri":
+		return fmt.Sprintf("%s must be a valid URI", field)
+	case "alpha":
+		return fmt.Sprintf("%s must contain only letters", field)
+	case "alphanum":
+		return fmt.Sprintf("%s must contain only letters and numbers", field)
+	case "numeric":
+		return fmt.Sprintf("%s must be numeric", field)
+	case "uuid":
+		return fmt.Sprintf("%s must be a valid UUID", field)
+	default:
+		return fmt.Sprintf("%s failed validation (%s)", field, fe.Tag())
+	}
+}
+
 func getPointer(val reflect.Value) any {
 	if val.Type().Kind() == reflect.Ptr {
 		if val.IsNil() {
@@ -748,26 +824,18 @@ func toHTTPError(err error) *HTTPError {
 				Err:     "missing_path_parameter",
 				Message: extractErr.Message,
 			}
+		case ErrTypeValidation:
+			return &HTTPError{
+				Code:    400,
+				Err:     "validation_failed",
+				Message: extractErr.Message,
+			}
 		default:
 			return &HTTPError{
 				Code:    400,
 				Err:     extractErr.Type,
 				Message: extractErr.Message,
 			}
-		}
-	}
-
-	// handle validator.ValidationErrors
-	var ve validator.ValidationErrors
-	if errors.As(err, &ve) {
-		parts := make([]string, 0, len(ve))
-		for _, ferr := range ve {
-			parts = append(parts, fmt.Sprintf("%s: %s", ferr.StructNamespace(), ferr.Tag()))
-		}
-		return &HTTPError{
-			Code:    400,
-			Err:     "validation_failed",
-			Message: strings.Join(parts, "; "),
 		}
 	}
 
