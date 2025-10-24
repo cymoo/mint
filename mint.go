@@ -49,43 +49,58 @@ type Config struct {
 
 var (
 	configMu           sync.RWMutex
-	config             = &Config{}
+	config             *Config
+	configOnce         sync.Once
 	CustomErrorHandler func(w http.ResponseWriter, err error)
 )
 
-// SetConfig configures the framework globally
-// This should be called once at application startup, before any handlers are registered
-// If cfg is nil, default configuration will be used
+func initDefaultConfig() {
+	configOnce.Do(func() {
+		if config == nil {
+			config = &Config{
+				EnableValidation: true,
+				Validator:        newDefaultValidator(),
+			}
+		}
+	})
+}
+
+func newDefaultValidator() *validator.Validate {
+	v := validator.New()
+	// Use json tag as field name for validation errors
+	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
+		name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
+		if name == "-" {
+			return ""
+		}
+		if name != "" {
+			return name
+		}
+		// Fallback to form tag
+		name = strings.SplitN(fld.Tag.Get("form"), ",", 2)[0]
+		if name == "-" {
+			return ""
+		}
+		return name
+	})
+	return v
+}
+
 func SetConfig(cfg *Config) {
 	configMu.Lock()
 	defer configMu.Unlock()
 	if cfg == nil {
-		cfg = &Config{EnableValidation: true}
+		initDefaultConfig()
+		return
 	}
-	// Enable validation by default
-	if cfg.Validator == nil && cfg.EnableValidation {
-		cfg.Validator = validator.New()
-		// Use json tag as field name for validation errors
-		cfg.Validator.RegisterTagNameFunc(func(fld reflect.StructField) string {
-			name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
-			if name == "-" {
-				return ""
-			}
-			if name != "" {
-				return name
-			}
-			// Fallback to form tag
-			name = strings.SplitN(fld.Tag.Get("form"), ",", 2)[0]
-			if name == "-" {
-				return ""
-			}
-			return name
-		})
+	if cfg.EnableValidation && cfg.Validator == nil {
+		cfg.Validator = newDefaultValidator()
 	}
 	config = cfg
 }
 
 func getConfig() *Config {
+	initDefaultConfig()
 	configMu.RLock()
 	defer configMu.RUnlock()
 	return config
@@ -135,7 +150,6 @@ func (c *Config) jsonUnmarshal(data []byte, v any) error {
 }
 
 func (c *Config) validate(v any) error {
-	c.logger().Printf("Validating value of type %T", v)
 	if !c.EnableValidation || c.Validator == nil {
 		return nil
 	}
