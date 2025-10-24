@@ -6,6 +6,7 @@ A lightweight, type-safe Go web framework built on top of `net/http` with automa
 
 - 🚀 **Zero Learning Curve** - Built on standard `net/http`, no custom router
 - 🎯 **Automatic Parameter Extraction** - JSON body, query params, form data, and path parameters
+- ✅ **Automatic Validation** - Built-in validation with user-friendly error messages
 - 🔒 **Type-Safe** - Leverages Go generics for compile-time type safety
 - 📦 **Flexible Response Handling** - Return any type: structs, strings, HTML, status codes, or custom results
 - ⚡ **Minimal Boilerplate** - Write handlers as simple functions
@@ -37,7 +38,7 @@ type User struct {
 }
 
 type UpdateUserRequest struct {
-	Name string `json:"name"`
+	Name string `json:"name" validate:"required,min=2,max=50"`
 }
 
 // Simple string response

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/gorilla/schema"
 )
 
@@ -33,30 +34,84 @@ type Config struct {
 	// JSONUnmarshalFunc for decoding JSON requests
 	// If nil, json.Unmarshal will be used
 	JSONUnmarshalFunc func(data []byte, v any) error
+
+	// Logger allows user to provide custom logger. If nil, log.Default() is used.
+	Logger *log.Logger
+
+	// EnableValidation enables automatic validation for JSON, Query, and Form extractors
+	// Default: true
+	EnableValidation bool
+
+	// Validator is the validation instance to use
+	// If nil and EnableValidation is true, a default validator will be created
+	Validator *validator.Validate
 }
 
 var (
 	configMu           sync.RWMutex
-	config             = &Config{}
+	config             *Config
+	configOnce         sync.Once
 	CustomErrorHandler func(w http.ResponseWriter, err error)
 )
 
-// SetConfig configures the framework globally
-// This should be called once at application startup, before any handlers are registered
-// If cfg is nil, default configuration will be used
+func initDefaultConfig() {
+	configOnce.Do(func() {
+		if config == nil {
+			config = &Config{
+				EnableValidation: true,
+				Validator:        newDefaultValidator(),
+			}
+		}
+	})
+}
+
+func newDefaultValidator() *validator.Validate {
+	v := validator.New()
+	// Use json tag as field name for validation errors
+	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
+		name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
+		if name == "-" {
+			return ""
+		}
+		if name != "" {
+			return name
+		}
+		// Fallback to form tag
+		name = strings.SplitN(fld.Tag.Get("form"), ",", 2)[0]
+		if name == "-" {
+			return ""
+		}
+		return name
+	})
+	return v
+}
+
 func SetConfig(cfg *Config) {
 	configMu.Lock()
 	defer configMu.Unlock()
 	if cfg == nil {
-		cfg = &Config{}
+		initDefaultConfig()
+		return
+	}
+	if cfg.EnableValidation && cfg.Validator == nil {
+		cfg.Validator = newDefaultValidator()
 	}
 	config = cfg
 }
 
 func getConfig() *Config {
+	initDefaultConfig()
 	configMu.RLock()
 	defer configMu.RUnlock()
 	return config
+}
+
+// logger returns the configured logger or the default logger.
+func (c *Config) logger() *log.Logger {
+	if c.Logger != nil {
+		return c.Logger
+	}
+	return log.Default()
 }
 
 func (c *Config) schemaDecoder() *schema.Decoder {
@@ -94,12 +149,20 @@ func (c *Config) jsonUnmarshal(data []byte, v any) error {
 	return c.JSONUnmarshalFunc(data, v)
 }
 
+func (c *Config) validate(v any) error {
+	if !c.EnableValidation || c.Validator == nil {
+		return nil
+	}
+	return c.Validator.Struct(v)
+}
+
 const (
 	ErrTypeBodyRead       = "body_read_error"
 	ErrTypeEmptyBody      = "empty_body"
 	ErrTypeFormParse      = "form_parse_error"
 	ErrTypePathConversion = "path_conversion_error"
 	ErrTypeMissingPath    = "missing_path_value"
+	ErrTypeValidation     = "validation_error"
 )
 
 var (
@@ -194,7 +257,15 @@ func (j *JSON[T]) Extract(r *http.Request) error {
 
 	target := getPointer(val)
 
-	return getConfig().jsonUnmarshal(body, target)
+	if err := getConfig().jsonUnmarshal(body, target); err != nil {
+		return err
+	}
+
+	if err := getConfig().validate(target); err != nil {
+		return NewValidationError(err)
+	}
+
+	return nil
 }
 
 type Query[T any] struct {
@@ -205,7 +276,15 @@ func (q *Query[T]) Extract(r *http.Request) error {
 	val := reflect.ValueOf(&q.Value).Elem()
 
 	target := getPointer(val)
-	return getConfig().schemaDecoder().Decode(target, r.URL.Query())
+	if err := getConfig().schemaDecoder().Decode(target, r.URL.Query()); err != nil {
+		return err
+	}
+
+	if err := getConfig().validate(target); err != nil {
+		return NewValidationError(err)
+	}
+
+	return nil
 }
 
 type Form[T any] struct {
@@ -219,7 +298,15 @@ func (f *Form[T]) Extract(r *http.Request) error {
 
 	val := reflect.ValueOf(&f.Value).Elem()
 	target := getPointer(val)
-	return getConfig().schemaDecoder().Decode(target, r.Form)
+	if err := getConfig().schemaDecoder().Decode(target, r.Form); err != nil {
+		return err
+	}
+
+	if err := getConfig().validate(target); err != nil {
+		return NewValidationError(err)
+	}
+
+	return nil
 }
 
 type Path[T PathValue] struct {
@@ -310,7 +397,7 @@ type ResponseWriter struct {
 
 func (rw *ResponseWriter) WriteHeader(code int) {
 	if rw.headerWritten {
-		log.Printf("Warning: multiple calls to WriteHeader, original status code: %d, new status code: %d", rw.statusCode, code)
+		getConfig().logger().Printf("Warning: multiple calls to WriteHeader, original status code: %d, new status code: %d", rw.statusCode, code)
 		return
 	}
 	if code <= 0 {
@@ -401,7 +488,7 @@ func H(fn any) http.HandlerFunc {
 				if err := extractor.Extract(r); err != nil {
 					e := handleError(rw, err)
 					if e != nil {
-						log.Printf("failed to write error response: %v", e)
+						getConfig().logger().Printf("failed to write error response: %v", e)
 					}
 					return
 				}
@@ -437,7 +524,7 @@ func H(fn any) http.HandlerFunc {
 
 			err := handleOneResult(rw, rv)
 			if err != nil {
-				log.Printf("failed to write response: %v", err)
+				getConfig().logger().Printf("failed to write response: %v", err)
 			}
 		}
 
@@ -451,7 +538,7 @@ func H(fn any) http.HandlerFunc {
 
 			e := handleTwoResults(rw, rv, err)
 			if e != nil {
-				log.Printf("failed to write response: %v", e)
+				getConfig().logger().Printf("failed to write response: %v", e)
 			}
 		}
 	}
@@ -503,6 +590,79 @@ func NewMissingPathError(field string) error {
 		Type:    ErrTypeMissingPath,
 		Field:   field,
 		Message: fmt.Sprintf("missing required path parameter: %s", field),
+	}
+}
+
+func NewValidationError(err error) error {
+	return &ExtractError{
+		Type:    ErrTypeValidation,
+		Message: formatValidationError(err),
+		Err:     err,
+	}
+}
+
+// formatValidationError formats validation errors into user-friendly messages
+func formatValidationError(err error) string {
+	var ve validator.ValidationErrors
+	if !errors.As(err, &ve) {
+		return err.Error()
+	}
+
+	if len(ve) == 0 {
+		return "validation failed"
+	}
+
+	messages := make([]string, 0, len(ve))
+	for _, fe := range ve {
+		field := fe.Field()
+		if field == "" {
+			field = fe.StructField()
+		}
+
+		msg := formatFieldError(field, fe)
+		messages = append(messages, msg)
+	}
+
+	return strings.Join(messages, "; ")
+}
+
+// formatFieldError formats a single field validation error
+func formatFieldError(field string, fe validator.FieldError) string {
+	switch fe.Tag() {
+	case "required":
+		return fmt.Sprintf("%s is required", field)
+	case "email":
+		return fmt.Sprintf("%s must be a valid email address", field)
+	case "min":
+		return fmt.Sprintf("%s must be at least %s", field, fe.Param())
+	case "max":
+		return fmt.Sprintf("%s must be at most %s", field, fe.Param())
+	case "len":
+		return fmt.Sprintf("%s must be %s characters long", field, fe.Param())
+	case "gt":
+		return fmt.Sprintf("%s must be greater than %s", field, fe.Param())
+	case "gte":
+		return fmt.Sprintf("%s must be greater than or equal to %s", field, fe.Param())
+	case "lt":
+		return fmt.Sprintf("%s must be less than %s", field, fe.Param())
+	case "lte":
+		return fmt.Sprintf("%s must be less than or equal to %s", field, fe.Param())
+	case "oneof":
+		return fmt.Sprintf("%s must be one of [%s]", field, fe.Param())
+	case "url":
+		return fmt.Sprintf("%s must be a valid URL", field)
+	case "uri":
+		return fmt.Sprintf("%s must be a valid URI", field)
+	case "alpha":
+		return fmt.Sprintf("%s must contain only letters", field)
+	case "alphanum":
+		return fmt.Sprintf("%s must contain only letters and numbers", field)
+	case "numeric":
+		return fmt.Sprintf("%s must be numeric", field)
+	case "uuid":
+		return fmt.Sprintf("%s must be a valid UUID", field)
+	default:
+		return fmt.Sprintf("%s failed validation (%s)", field, fe.Tag())
 	}
 }
 
@@ -674,6 +834,12 @@ func toHTTPError(err error) *HTTPError {
 				Err:     "missing_path_parameter",
 				Message: extractErr.Message,
 			}
+		case ErrTypeValidation:
+			return &HTTPError{
+				Code:    400,
+				Err:     "validation_failed",
+				Message: extractErr.Message,
+			}
 		default:
 			return &HTTPError{
 				Code:    400,
@@ -774,14 +940,14 @@ func extractPatternNames(pattern string) []string {
 	for i, char := range pattern {
 		if char == '{' {
 			if inParam {
-				log.Printf("warning: nested braces at position %d in pattern %q", i, pattern)
+				getConfig().logger().Printf("warning: nested braces at position %d in pattern %q", i, pattern)
 			}
 			inParam = true
 			depth++
 			currentName = ""
 		} else if char == '}' {
 			if !inParam {
-				log.Printf("warning: unmatched closing brace at position %d in pattern %q", i, pattern)
+				getConfig().logger().Printf("warning: unmatched closing brace at position %d in pattern %q", i, pattern)
 				continue
 			}
 			inParam = false
@@ -795,7 +961,7 @@ func extractPatternNames(pattern string) []string {
 	}
 
 	if depth != 0 {
-		log.Printf("warning: unbalanced braces in pattern %q", pattern)
+		getConfig().logger().Printf("warning: unbalanced braces in pattern %q", pattern)
 	}
 
 	return names

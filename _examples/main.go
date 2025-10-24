@@ -29,7 +29,7 @@ type UpdateUserRequest struct {
 
 type UserQueryParams struct {
 	Page  int    `schema:"page"`
-	Limit int    `schema:"limit"`
+	Limit int    `schema:"limit" validate:"gte=0,lte=100"`
 	Sort  string `schema:"sort"`
 }
 
