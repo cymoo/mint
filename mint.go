@@ -20,51 +20,109 @@ import (
 // Config holds global configuration for the framework
 type Config struct {
 	// SchemaDecoder for parsing form and query parameters
-	// If nil, a default decoder will be created
 	SchemaDecoder *schema.Decoder
 
 	// JSONMarshalFunc for encoding JSON responses
-	// If nil, json.Marshal will be used
 	JSONMarshalFunc func(v any) ([]byte, error)
 
 	// JSONEncodeFunc for streaming JSON encoding
-	// If nil, json.NewEncoder(w).Encode(v) will be used
 	JSONEncodeFunc func(w io.Writer, v any) error
 
 	// JSONUnmarshalFunc for decoding JSON requests
-	// If nil, json.Unmarshal will be used
 	JSONUnmarshalFunc func(data []byte, v any) error
 
-	// Logger allows user to provide custom logger. If nil, log.Default() is used.
+	// Logger allows user to provide custom logger
 	Logger *log.Logger
 
 	// EnableValidation enables automatic validation for JSON, Query, and Form extractors
-	// Default: true
 	EnableValidation bool
 
 	// Validator is the validation instance to use
-	// If nil and EnableValidation is true, a default validator will be created
 	Validator *validator.Validate
+
+	// ErrorHandler allows custom error handling
+	ErrorHandler func(w http.ResponseWriter, err error)
 }
 
-var (
-	configMu           sync.RWMutex
-	config             *Config
-	configOnce         sync.Once
-	CustomErrorHandler func(w http.ResponseWriter, err error)
-)
+// Option is a functional option for configuring the framework
+type Option func(*Config)
 
-func initDefaultConfig() {
-	configOnce.Do(func() {
-		if config == nil {
-			config = &Config{
-				EnableValidation: true,
-				Validator:        newDefaultValidator(),
-			}
-		}
-	})
+// WithSchemaDecoder sets a custom schema decoder
+func WithSchemaDecoder(decoder *schema.Decoder) Option {
+	return func(c *Config) {
+		c.SchemaDecoder = decoder
+	}
 }
 
+// WithJSONMarshal sets a custom JSON marshal function
+func WithJSONMarshal(fn func(v any) ([]byte, error)) Option {
+	return func(c *Config) {
+		c.JSONMarshalFunc = fn
+	}
+}
+
+// WithJSONEncode sets a custom JSON encode function
+func WithJSONEncode(fn func(w io.Writer, v any) error) Option {
+	return func(c *Config) {
+		c.JSONEncodeFunc = fn
+	}
+}
+
+// WithJSONUnmarshal sets a custom JSON unmarshal function
+func WithJSONUnmarshal(fn func(data []byte, v any) error) Option {
+	return func(c *Config) {
+		c.JSONUnmarshalFunc = fn
+	}
+}
+
+// WithLogger sets a custom logger
+func WithLogger(logger *log.Logger) Option {
+	return func(c *Config) {
+		c.Logger = logger
+	}
+}
+
+// WithValidation enables/disables validation
+func WithValidation(enabled bool) Option {
+	return func(c *Config) {
+		c.EnableValidation = enabled
+	}
+}
+
+// WithValidator sets a custom validator
+func WithValidator(v *validator.Validate) Option {
+	return func(c *Config) {
+		c.Validator = v
+	}
+}
+
+// WithErrorHandler sets a custom error handler
+func WithErrorHandler(handler func(w http.ResponseWriter, err error)) Option {
+	return func(c *Config) {
+		c.ErrorHandler = handler
+	}
+}
+
+// defaultConfig returns a new config with sensible defaults
+func defaultConfig() *Config {
+	return &Config{
+		SchemaDecoder:     newDefaultSchemaDecoder(),
+		EnableValidation:  true,
+		Validator:         newDefaultValidator(),
+		Logger:            log.Default(),
+		JSONMarshalFunc:   json.Marshal,
+		JSONUnmarshalFunc: json.Unmarshal,
+	}
+}
+
+// newDefaultSchemaDecoder creates a schema decoder with sensible defaults
+func newDefaultSchemaDecoder() *schema.Decoder {
+	decoder := schema.NewDecoder()
+	decoder.IgnoreUnknownKeys(true)
+	return decoder
+}
+
+// newDefaultValidator creates a validator with sensible defaults
 func newDefaultValidator() *validator.Validate {
 	v := validator.New()
 	// Use json tag as field name for validation errors
@@ -86,50 +144,91 @@ func newDefaultValidator() *validator.Validate {
 	return v
 }
 
-func SetConfig(cfg *Config) {
-	configMu.Lock()
-	defer configMu.Unlock()
-	if cfg == nil {
-		initDefaultConfig()
-		return
-	}
-	if cfg.EnableValidation && cfg.Validator == nil {
-		cfg.Validator = newDefaultValidator()
-	}
-	config = cfg
+// configManager manages the global configuration
+type configManager struct {
+	mu     sync.RWMutex
+	config *Config
+	once   sync.Once
 }
 
-func getConfig() *Config {
-	initDefaultConfig()
-	configMu.RLock()
-	defer configMu.RUnlock()
-	return config
+var global = &configManager{
+	config: defaultConfig(),
 }
 
-// logger returns the configured logger or the default logger.
-func (c *Config) logger() *log.Logger {
-	if c.Logger != nil {
-		return c.Logger
+// Initialize sets up the global configuration with options
+// This should be called once at application startup
+func Initialize(opts ...Option) {
+	global.once.Do(func() {
+		cfg := defaultConfig()
+		for _, opt := range opts {
+			opt(cfg)
+		}
+		global.config = cfg
+	})
+}
+
+// Configure updates the global configuration (can be called multiple times)
+// Use Initialize for one-time setup, Configure for runtime changes
+func Configure(opts ...Option) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+
+	// Create a copy of current config to avoid mutating in place
+	newConfig := *global.config
+	for _, opt := range opts {
+		opt(&newConfig)
+	}
+
+	// Auto-create validator if validation is enabled but no validator exists
+	if newConfig.EnableValidation && newConfig.Validator == nil {
+		newConfig.Validator = newDefaultValidator()
+	}
+
+	global.config = &newConfig
+}
+
+// Reset resets the configuration to defaults (useful for testing)
+func Reset() {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	global.config = defaultConfig()
+	global.once = sync.Once{}
+}
+
+// get retrieves the current global configuration
+func (cm *configManager) get() *Config {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.config
+}
+
+// Helper methods for config access (internal use)
+
+func logger() *log.Logger {
+	cfg := global.get()
+	if cfg.Logger != nil {
+		return cfg.Logger
 	}
 	return log.Default()
 }
 
-func (c *Config) schemaDecoder() *schema.Decoder {
-	if c.SchemaDecoder == nil {
-		decoder := schema.NewDecoder()
-		decoder.IgnoreUnknownKeys(true)
-		return decoder
+func schemaDecoder() *schema.Decoder {
+	cfg := global.get()
+	if cfg.SchemaDecoder != nil {
+		return cfg.SchemaDecoder
 	}
-	return c.SchemaDecoder
+	return newDefaultSchemaDecoder()
 }
 
-func (c *Config) jsonEncode(w io.Writer, v any) error {
-	if c.JSONEncodeFunc != nil {
-		return c.JSONEncodeFunc(w, v)
+func jsonEncode(w io.Writer, v any) error {
+	cfg := global.get()
+
+	if cfg.JSONEncodeFunc != nil {
+		return cfg.JSONEncodeFunc(w, v)
 	}
 
-	if c.JSONMarshalFunc != nil {
-		jsonData, err := c.JSONMarshalFunc(v)
+	if cfg.JSONMarshalFunc != nil {
+		jsonData, err := cfg.JSONMarshalFunc(v)
 		if err != nil {
 			return err
 		}
@@ -142,18 +241,24 @@ func (c *Config) jsonEncode(w io.Writer, v any) error {
 	return encoder.Encode(v)
 }
 
-func (c *Config) jsonUnmarshal(data []byte, v any) error {
-	if c.JSONUnmarshalFunc == nil {
-		return json.Unmarshal(data, v)
+func jsonUnmarshal(data []byte, v any) error {
+	cfg := global.get()
+	if cfg.JSONUnmarshalFunc != nil {
+		return cfg.JSONUnmarshalFunc(data, v)
 	}
-	return c.JSONUnmarshalFunc(data, v)
+	return json.Unmarshal(data, v)
 }
 
-func (c *Config) validate(v any) error {
-	if !c.EnableValidation || c.Validator == nil {
+func validate(v any) error {
+	cfg := global.get()
+	if !cfg.EnableValidation || cfg.Validator == nil {
 		return nil
 	}
-	return c.Validator.Struct(v)
+	return cfg.Validator.Struct(v)
+}
+
+func errorHandler() func(w http.ResponseWriter, err error) {
+	return global.get().ErrorHandler
 }
 
 const (
@@ -257,11 +362,11 @@ func (j *JSON[T]) Extract(r *http.Request) error {
 
 	target := getPointer(val)
 
-	if err := getConfig().jsonUnmarshal(body, target); err != nil {
+	if err := jsonUnmarshal(body, target); err != nil {
 		return err
 	}
 
-	if err := getConfig().validate(target); err != nil {
+	if err := validate(target); err != nil {
 		return NewValidationError(err)
 	}
 
@@ -276,11 +381,11 @@ func (q *Query[T]) Extract(r *http.Request) error {
 	val := reflect.ValueOf(&q.Value).Elem()
 
 	target := getPointer(val)
-	if err := getConfig().schemaDecoder().Decode(target, r.URL.Query()); err != nil {
+	if err := schemaDecoder().Decode(target, r.URL.Query()); err != nil {
 		return err
 	}
 
-	if err := getConfig().validate(target); err != nil {
+	if err := validate(target); err != nil {
 		return NewValidationError(err)
 	}
 
@@ -298,11 +403,11 @@ func (f *Form[T]) Extract(r *http.Request) error {
 
 	val := reflect.ValueOf(&f.Value).Elem()
 	target := getPointer(val)
-	if err := getConfig().schemaDecoder().Decode(target, r.Form); err != nil {
+	if err := schemaDecoder().Decode(target, r.Form); err != nil {
 		return err
 	}
 
-	if err := getConfig().validate(target); err != nil {
+	if err := validate(target); err != nil {
 		return NewValidationError(err)
 	}
 
@@ -397,7 +502,7 @@ type ResponseWriter struct {
 
 func (rw *ResponseWriter) WriteHeader(code int) {
 	if rw.headerWritten {
-		getConfig().logger().Printf("Warning: multiple calls to WriteHeader, original status code: %d, new status code: %d", rw.statusCode, code)
+		logger().Printf("Warning: multiple calls to WriteHeader, original status code: %d, new status code: %d", rw.statusCode, code)
 		return
 	}
 	if code <= 0 {
@@ -488,7 +593,7 @@ func H(fn any) http.HandlerFunc {
 				if err := extractor.Extract(r); err != nil {
 					e := handleError(rw, err)
 					if e != nil {
-						getConfig().logger().Printf("failed to write error response: %v", e)
+						logger().Printf("failed to write error response: %v", e)
 					}
 					return
 				}
@@ -524,7 +629,7 @@ func H(fn any) http.HandlerFunc {
 
 			err := handleOneResult(rw, rv)
 			if err != nil {
-				getConfig().logger().Printf("failed to write response: %v", err)
+				logger().Printf("failed to write response: %v", err)
 			}
 		}
 
@@ -538,7 +643,7 @@ func H(fn any) http.HandlerFunc {
 
 			e := handleTwoResults(rw, rv, err)
 			if e != nil {
-				getConfig().logger().Printf("failed to write response: %v", e)
+				logger().Printf("failed to write response: %v", e)
 			}
 		}
 	}
@@ -741,7 +846,7 @@ func handleCommonTypes(w http.ResponseWriter, data any) error {
 		return err
 	default:
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		return config.jsonEncode(w, data)
+		return jsonEncode(w, data)
 	}
 }
 
@@ -762,8 +867,8 @@ func handleResult(w http.ResponseWriter, result Result[any]) error {
 }
 
 func handleError(w http.ResponseWriter, err error) error {
-	if CustomErrorHandler != nil {
-		CustomErrorHandler(w, err)
+	if errorHandler() != nil {
+		errorHandler()(w, err)
 		return nil
 	}
 
@@ -787,7 +892,7 @@ func handleError(w http.ResponseWriter, err error) error {
 		log.Println(httpErr.Error())
 	}
 
-	return config.jsonEncode(w, httpErr)
+	return jsonEncode(w, httpErr)
 }
 
 func toHTTPError(err error) *HTTPError {
@@ -944,14 +1049,14 @@ func extractPatternNames(pattern string) []string {
 	for i, char := range pattern {
 		if char == '{' {
 			if inParam {
-				getConfig().logger().Printf("warning: nested braces at position %d in pattern %q", i, pattern)
+				logger().Printf("warning: nested braces at position %d in pattern %q", i, pattern)
 			}
 			inParam = true
 			depth++
 			currentName = ""
 		} else if char == '}' {
 			if !inParam {
-				getConfig().logger().Printf("warning: unmatched closing brace at position %d in pattern %q", i, pattern)
+				logger().Printf("warning: unmatched closing brace at position %d in pattern %q", i, pattern)
 				continue
 			}
 			inParam = false
@@ -965,7 +1070,7 @@ func extractPatternNames(pattern string) []string {
 	}
 
 	if depth != 0 {
-		getConfig().logger().Printf("warning: unbalanced braces in pattern %q", pattern)
+		logger().Printf("warning: unbalanced braces in pattern %q", pattern)
 	}
 
 	return names

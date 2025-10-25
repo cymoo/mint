@@ -327,35 +327,257 @@ Custom extractors make your handlers cleaner by moving data extraction and valid
 
 ## ⚙️ Configuration
 
-Customize framework behavior globally:
+Mint provides flexible configuration options using the functional options pattern for clean, type-safe customization.
+
+### Basic Setup
 
 ```go
 import (
+    "log"
+    "github.com/cymoo/mint"
+)
+
+func main() {
+    // Initialize configuration at application startup (recommended)
+    m.Initialize(
+        m.WithLogger(log.Default()),
+        m.WithValidation(true),
+    )
+    
+    // Your application code...
+}
+```
+
+### Available Options
+
+#### JSON Encoding/Decoding
+
+Customize JSON marshaling and unmarshaling:
+
+```go
+import "encoding/json"
+
+m.Initialize(
+    // Custom JSON marshal function
+    m.WithJSONMarshal(func(v any) ([]byte, error) {
+        return json.MarshalIndent(v, "", "  ") // Pretty print
+    }),
+    
+    // Custom JSON encode function (streaming)
+    m.WithJSONEncode(func(w io.Writer, v any) error {
+        encoder := json.NewEncoder(w)
+        encoder.SetIndent("", "  ")
+        return encoder.Encode(v)
+    }),
+    
+    // Custom JSON unmarshal function
+    m.WithJSONUnmarshal(json.Unmarshal),
+)
+```
+
+#### Schema Decoder
+
+Customize form and query parameter parsing:
+
+```go
+import "github.com/gorilla/schema"
+
+decoder := schema.NewDecoder()
+decoder.IgnoreUnknownKeys(true)
+decoder.SetAliasTag("form")
+
+m.Initialize(
+    m.WithSchemaDecoder(decoder),
+)
+```
+
+#### Logging
+
+Provide a custom logger:
+
+```go
+import (
+    "log"
+    "os"
+)
+
+customLogger := log.New(os.Stdout, "[MINT] ", log.LstdFlags)
+
+m.Initialize(
+    m.WithLogger(customLogger),
+)
+```
+
+#### Validation
+
+Control validation behavior:
+
+```go
+import "github.com/go-playground/validator/v10"
+
+// Disable validation
+m.Initialize(
+    m.WithValidation(false),
+)
+
+// Or use custom validator
+v := validator.New()
+v.RegisterValidation("customrule", myValidationFunc)
+
+m.Initialize(
+    m.WithValidator(v),
+)
+```
+
+#### Error Handling
+
+Customize error response format:
+
+```go
+m.Initialize(
+    m.WithErrorHandler(func(w http.ResponseWriter, err error) {
+        // Custom error logging
+        log.Printf("[ERROR] %v", err)
+        
+        // Custom error response
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(500)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": err.Error(),
+            "timestamp": time.Now().Format(time.RFC3339),
+        })
+    }),
+)
+```
+
+### Configuration Methods
+
+#### `Initialize(opts ...Option)`
+
+**One-time setup** at application startup. Uses `sync.Once` internally - safe to call multiple times but only the first call takes effect:
+
+```go
+func main() {
+    m.Initialize(
+        m.WithLogger(customLogger),
+        m.WithValidation(true),
+    )
+    
+    // Start your server...
+}
+```
+
+#### `Configure(opts ...Option)`
+
+**Runtime configuration updates**. Can be called multiple times to modify settings after initialization:
+
+```go
+// Enable debug mode at runtime
+m.Configure(
+    m.WithJSONMarshal(func(v any) ([]byte, error) {
+        return json.MarshalIndent(v, "", "  ")
+    }),
+)
+```
+
+#### `Reset()`
+
+**Reset to defaults** - useful for testing:
+
+```go
+func TestSomething(t *testing.T) {
+    defer m.Reset() // Restore defaults after test
+    
+    m.Configure(m.WithValidation(false))
+    // Test code...
+}
+```
+
+### Complete Configuration Example
+
+```go
+package main
+
+import (
     "encoding/json"
+    "io"
+    "log"
+    "net/http"
+    "os"
+    "time"
+    
+    "github.com/cymoo/mint"
+    "github.com/go-playground/validator/v10"
     "github.com/gorilla/schema"
 )
 
-m.SetConfig(&m.Config{
-    // Custom JSON marshaling
-    JSONMarshalFunc: func(v any) ([]byte, error) {
-        return json.MarshalIndent(v, "", "  ")
-    },
+func main() {
+    // Configure logger
+    logger := log.New(os.Stdout, "[API] ", log.LstdFlags|log.Lshortfile)
     
-    // Custom JSON unmarshaling
-    JSONUnmarshalFunc: json.Unmarshal,
+    // Configure schema decoder
+    decoder := schema.NewDecoder()
+    decoder.IgnoreUnknownKeys(true)
+    decoder.SetAliasTag("form")
     
-    // Custom schema decoder for query/form params
-    SchemaDecoder: func() *schema.Decoder {
-        decoder := schema.NewDecoder()
-        decoder.IgnoreUnknownKeys(true)
-        return decoder
-    }(),
-})
+    // Configure validator
+    v := validator.New()
+    v.RegisterValidation("username", func(fl validator.FieldLevel) bool {
+        return len(fl.Field().String()) >= 3
+    })
+    
+    // Initialize framework
+    m.Initialize(
+        m.WithLogger(logger),
+        m.WithSchemaDecoder(decoder),
+        m.WithValidator(v),
+        m.WithJSONMarshal(func(v any) ([]byte, error) {
+            return json.MarshalIndent(v, "", "  ")
+        }),
+        m.WithErrorHandler(func(w http.ResponseWriter, err error) {
+            logger.Printf("Error occurred: %v", err)
+            
+            response := map[string]any{
+                "success": false,
+                "error":   err.Error(),
+                "time":    time.Now().Unix(),
+            }
+            
+            w.Header().Set("Content-Type", "application/json")
+            w.WriteHeader(http.StatusInternalServerError)
+            json.NewEncoder(w).Encode(response)
+        }),
+    )
+    
+    // Setup routes
+    mux := http.NewServeMux()
+    // ... your routes
+    
+    logger.Println("Server starting on :8080")
+    log.Fatal(http.ListenAndServe(":8080", mux))
+}
+```
 
-// Custom error handler
-m.CustomErrorHandler = func(w http.ResponseWriter, err error) {
-    log.Printf("Error: %v", err)
-    // Your custom error response logic
+### Thread Safety
+
+All configuration methods are thread-safe:
+- `Initialize()` uses `sync.Once` for one-time setup
+- `Configure()` and `Reset()` use mutex locks for safe concurrent access
+- Config reads use `RWMutex` for efficient concurrent access
+
+### Default Configuration
+
+If you don't call `Initialize()` or `Configure()`, Mint uses sensible defaults:
+
+```go
+// Default config (automatically applied)
+{
+    SchemaDecoder:     schema.NewDecoder() with IgnoreUnknownKeys(true),
+    EnableValidation:  true,
+    Validator:         validator with JSON/form tag support,
+    Logger:            log.Default(),
+    JSONMarshalFunc:   json.Marshal,
+    JSONUnmarshalFunc: json.Unmarshal,
 }
 ```
 

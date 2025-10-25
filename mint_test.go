@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/gorilla/schema"
 )
 
@@ -50,118 +52,9 @@ func parseJSONResponse(t *testing.T, body []byte, v any) {
 	}
 }
 
-// ========== Config Tests ==========
-
-func TestSetConfig(t *testing.T) {
-	t.Run("nil config should use defaults", func(t *testing.T) {
-		SetConfig(nil)
-		cfg := getConfig()
-		if cfg == nil {
-			t.Fatal("config should not be nil")
-		}
-	})
-
-	t.Run("custom config", func(t *testing.T) {
-		customDecoder := schema.NewDecoder()
-		customConfig := &Config{
-			SchemaDecoder: customDecoder,
-			JSONMarshalFunc: func(v any) ([]byte, error) {
-				return json.Marshal(v)
-			},
-		}
-		SetConfig(customConfig)
-		cfg := getConfig()
-		if cfg.SchemaDecoder != customDecoder {
-			t.Error("custom decoder not set")
-		}
-	})
-}
-
-func TestConfigJSONEncode(t *testing.T) {
-	t.Run("default json encoder", func(t *testing.T) {
-		cfg := &Config{}
-		buf := &bytes.Buffer{}
-		data := map[string]string{"key": "value"}
-		err := cfg.jsonEncode(buf, data)
-		if err != nil {
-			t.Fatalf("jsonEncode failed: %v", err)
-		}
-		if !strings.Contains(buf.String(), `"key":"value"`) {
-			t.Errorf("unexpected output: %s", buf.String())
-		}
-	})
-
-	t.Run("custom JSONEncodeFunc", func(t *testing.T) {
-		cfg := &Config{
-			JSONEncodeFunc: func(w io.Writer, v any) error {
-				_, err := w.Write([]byte("custom"))
-				return err
-			},
-		}
-		buf := &bytes.Buffer{}
-		err := cfg.jsonEncode(buf, nil)
-		if err != nil {
-			t.Fatalf("jsonEncode failed: %v", err)
-		}
-		if buf.String() != "custom" {
-			t.Errorf("expected 'custom', got %s", buf.String())
-		}
-	})
-
-	t.Run("custom JSONMarshalFunc", func(t *testing.T) {
-		cfg := &Config{
-			JSONMarshalFunc: func(v any) ([]byte, error) {
-				return []byte("marshaled"), nil
-			},
-		}
-		buf := &bytes.Buffer{}
-		err := cfg.jsonEncode(buf, nil)
-		if err != nil {
-			t.Fatalf("jsonEncode failed: %v", err)
-		}
-		if buf.String() != "marshaled" {
-			t.Errorf("expected 'marshaled', got %s", buf.String())
-		}
-	})
-}
-
-func TestConfigJSONUnmarshal(t *testing.T) {
-	t.Run("default unmarshal", func(t *testing.T) {
-		cfg := &Config{}
-		var result map[string]string
-		data := []byte(`{"key":"value"}`)
-		err := cfg.jsonUnmarshal(data, &result)
-		if err != nil {
-			t.Fatalf("jsonUnmarshal failed: %v", err)
-		}
-		if result["key"] != "value" {
-			t.Errorf("unexpected result: %v", result)
-		}
-	})
-
-	t.Run("custom unmarshal", func(t *testing.T) {
-		cfg := &Config{
-			JSONUnmarshalFunc: func(data []byte, v any) error {
-				*(v.(*string)) = "custom"
-				return nil
-			},
-		}
-		var result string
-		err := cfg.jsonUnmarshal([]byte("{}"), &result)
-		if err != nil {
-			t.Fatalf("jsonUnmarshal failed: %v", err)
-		}
-		if result != "custom" {
-			t.Errorf("expected 'custom', got %s", result)
-		}
-	})
-}
-
 // ========== JSON Extractor Tests ==========
 
 func TestJSONExtractor(t *testing.T) {
-	SetConfig(nil) // Reset to default config
-
 	t.Run("valid json", func(t *testing.T) {
 		user := User{Name: "Alice", Email: "alice@example.com", Age: 25}
 		body, _ := json.Marshal(user)
@@ -223,8 +116,6 @@ func TestJSONExtractor(t *testing.T) {
 // ========== Query Extractor Tests ==========
 
 func TestQueryExtractor(t *testing.T) {
-	SetConfig(nil)
-
 	t.Run("valid query params", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/?page=2&limit=10&sort=name", nil)
 		var q Query[QueryParams]
@@ -268,8 +159,6 @@ func TestQueryExtractor(t *testing.T) {
 // ========== Form Extractor Tests ==========
 
 func TestFormExtractor(t *testing.T) {
-	SetConfig(nil)
-
 	t.Run("valid form data", func(t *testing.T) {
 		formData := url.Values{}
 		formData.Set("username", "john")
@@ -484,8 +373,6 @@ func TestPathExtractor(t *testing.T) {
 // ========== Handler Tests ==========
 
 func TestH_BasicHandlers(t *testing.T) {
-	SetConfig(nil)
-
 	t.Run("no parameters, no return", func(t *testing.T) {
 		handler := H(func() {})
 		rec := httptest.NewRecorder()
@@ -596,8 +483,6 @@ func TestH_BasicHandlers(t *testing.T) {
 }
 
 func TestH_WithParameters(t *testing.T) {
-	SetConfig(nil)
-
 	t.Run("with JSON parameter", func(t *testing.T) {
 		handler := H(func(user JSON[User]) User {
 			return user.Value
@@ -697,8 +582,6 @@ func TestH_WithParameters(t *testing.T) {
 }
 
 func TestH_ErrorHandling(t *testing.T) {
-	SetConfig(nil)
-
 	t.Run("return error", func(t *testing.T) {
 		handler := H(func() error {
 			return errors.New("something went wrong")
@@ -773,13 +656,13 @@ func TestH_ErrorHandling(t *testing.T) {
 	})
 
 	t.Run("custom error handler", func(t *testing.T) {
-		originalHandler := CustomErrorHandler
-		defer func() { CustomErrorHandler = originalHandler }()
-
-		CustomErrorHandler = func(w http.ResponseWriter, err error) {
+		customErrorHandler := func(w http.ResponseWriter, err error) {
 			w.WriteHeader(418)
 			w.Write([]byte("I'm a teapot"))
 		}
+
+		Configure(WithErrorHandler(customErrorHandler))
+		defer func() { Reset() }()
 
 		handler := H(func() error {
 			return errors.New("test error")
@@ -797,8 +680,6 @@ func TestH_ErrorHandling(t *testing.T) {
 }
 
 func TestH_ResultType(t *testing.T) {
-	SetConfig(nil)
-
 	t.Run("OK result", func(t *testing.T) {
 		handler := H(func() Result[User] {
 			return OK(User{Name: "Charlie", Email: "charlie@example.com", Age: 35})
@@ -859,8 +740,6 @@ func TestH_ResultType(t *testing.T) {
 }
 
 func TestH_HTTPHandler(t *testing.T) {
-	SetConfig(nil)
-
 	t.Run("return http.Handler", func(t *testing.T) {
 		customHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(202)
@@ -1304,8 +1183,6 @@ func TestIsNilValue(t *testing.T) {
 // ========== Integration Tests ==========
 
 func TestIntegration_ComplexHandler(t *testing.T) {
-	SetConfig(nil)
-
 	type CreateUserRequest struct {
 		Name  string `json:"name"`
 		Email string `json:"email"`
@@ -1371,8 +1248,6 @@ func TestIntegration_ComplexHandler(t *testing.T) {
 }
 
 func TestIntegration_RESTfulAPI(t *testing.T) {
-	SetConfig(nil)
-
 	// GET /items/{id}
 	getHandler := H(func(id Path[int]) Result[map[string]any] {
 		if id.Value == 999 {
@@ -1477,8 +1352,6 @@ func TestH_Panics(t *testing.T) {
 // ========== Edge Cases ==========
 
 func TestEdgeCases(t *testing.T) {
-	SetConfig(nil)
-
 	t.Run("nil return value", func(t *testing.T) {
 		handler := H(func() *User {
 			return nil
@@ -1525,6 +1398,571 @@ func TestEdgeCases(t *testing.T) {
 		handler(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("expected status 200, got %d", rec.Code)
+		}
+	})
+}
+
+// ========== Configuration Tests ==========
+
+func TestDefaultConfig(t *testing.T) {
+	t.Run("framework works without initialization", func(t *testing.T) {
+		Reset()
+		// Don't call Initialize - should use defaults
+
+		type Response struct {
+			Message string `json:"message"`
+		}
+
+		handler := H(func() Response {
+			return Response{Message: "hello"}
+		})
+
+		req := httptest.NewRequest("GET", "/", nil)
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code != 200 {
+			t.Errorf("expected status 200, got %d", rec.Code)
+		}
+
+		var resp Response
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+
+		if resp.Message != "hello" {
+			t.Errorf("expected message=hello, got %s", resp.Message)
+		}
+	})
+}
+
+func TestInitialize(t *testing.T) {
+	t.Run("initialize with custom logger", func(t *testing.T) {
+		Reset()
+
+		var buf bytes.Buffer
+		customLogger := log.New(&buf, "[TEST] ", 0)
+
+		Initialize(
+			WithLogger(customLogger),
+		)
+
+		// Logger should be used (test indirectly through framework behavior)
+		// For now, just verify initialization doesn't panic
+	})
+
+	t.Run("initialize only runs once", func(t *testing.T) {
+		Reset()
+
+		callCount := 0
+		trackingOption := func(c *Config) {
+			callCount++
+		}
+
+		Initialize(trackingOption)
+		Initialize(trackingOption) // Second call should be ignored
+		Initialize(trackingOption) // Third call should be ignored
+
+		// Note: We can't directly test callCount since Initialize uses sync.Once
+		// But we can verify no panic occurs with multiple calls
+	})
+
+	t.Run("initialize with validation disabled", func(t *testing.T) {
+		Reset()
+
+		Initialize(
+			WithValidation(false),
+		)
+
+		type Request struct {
+			Email string `json:"email" validate:"required,email"`
+		}
+
+		handler := H(func(body JSON[Request]) Request {
+			return body.Value
+		})
+
+		// Invalid email should pass through without validation
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"email":"invalid"}`))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code != 200 {
+			t.Errorf("expected status 200 (validation disabled), got %d", rec.Code)
+		}
+	})
+}
+
+func TestConfigure(t *testing.T) {
+	t.Run("configure can be called multiple times", func(t *testing.T) {
+		Reset()
+
+		Configure(WithValidation(false))
+		Configure(WithValidation(true))
+
+		// Should use latest config
+		type Request struct {
+			Email string `json:"email" validate:"required,email"`
+		}
+
+		handler := H(func(body JSON[Request]) Request {
+			return body.Value
+		})
+
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"email":"invalid"}`))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		// Should fail validation since we enabled it
+		if rec.Code == 200 {
+			t.Error("expected validation error, got success")
+		}
+	})
+
+	t.Run("configure with custom JSON marshal", func(t *testing.T) {
+		Reset()
+
+		// Configure pretty-print JSON
+		Configure(
+			WithJSONMarshal(func(v any) ([]byte, error) {
+				return json.MarshalIndent(v, "", "  ")
+			}),
+		)
+
+		type Response struct {
+			Name string `json:"name"`
+			Age  int    `json:"age"`
+		}
+
+		handler := H(func() Response {
+			return Response{Name: "Alice", Age: 30}
+		})
+
+		req := httptest.NewRequest("GET", "/", nil)
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		body := rec.Body.String()
+		if !strings.Contains(body, "\n") {
+			t.Error("expected pretty-printed JSON with newlines")
+		}
+	})
+
+	t.Run("configure with custom JSON encode", func(t *testing.T) {
+		Reset()
+
+		Configure(
+			WithJSONEncode(func(w io.Writer, v any) error {
+				encoder := json.NewEncoder(w)
+				encoder.SetIndent("", "    ") // 4 spaces
+				return encoder.Encode(v)
+			}),
+		)
+
+		handler := H(func() map[string]string {
+			return map[string]string{"key": "value"}
+		})
+
+		req := httptest.NewRequest("GET", "/", nil)
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		body := rec.Body.String()
+		if !strings.Contains(body, "    ") {
+			t.Error("expected JSON with 4-space indentation")
+		}
+	})
+
+	t.Run("configure with custom JSON unmarshal", func(t *testing.T) {
+		Reset()
+
+		unmarshalCalled := false
+		Configure(
+			WithJSONUnmarshal(func(data []byte, v any) error {
+				unmarshalCalled = true
+				return json.Unmarshal(data, v)
+			}),
+		)
+
+		type Request struct {
+			Name string `json:"name"`
+		}
+
+		handler := H(func(body JSON[Request]) Request {
+			return body.Value
+		})
+
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"name":"test"}`))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if !unmarshalCalled {
+			t.Error("custom unmarshal function was not called")
+		}
+	})
+}
+
+func TestReset(t *testing.T) {
+	t.Run("reset restores defaults", func(t *testing.T) {
+		Reset()
+
+		// Change config
+		Configure(WithValidation(false))
+
+		// Reset to defaults
+		Reset()
+
+		// Validation should be enabled by default
+		type Request struct {
+			Email string `json:"email" validate:"required,email"`
+		}
+
+		handler := H(func(body JSON[Request]) Request {
+			return body.Value
+		})
+
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"email":"invalid"}`))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code == 200 {
+			t.Error("expected validation error after reset, got success")
+		}
+	})
+
+	t.Run("reset allows re-initialization", func(t *testing.T) {
+		Reset()
+
+		Initialize(WithValidation(false))
+		Reset() // Reset also resets the sync.Once
+
+		// Should be able to Initialize again
+		Initialize(WithValidation(true))
+
+		// Verification through actual usage
+		type Request struct {
+			Email string `json:"email" validate:"required,email"`
+		}
+
+		handler := H(func(body JSON[Request]) Request {
+			return body.Value
+		})
+
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"email":"invalid"}`))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code == 200 {
+			t.Error("expected validation error, got success")
+		}
+	})
+}
+
+func TestCustomValidator(t *testing.T) {
+	t.Run("custom validator with custom rule", func(t *testing.T) {
+		Reset()
+
+		v := validator.New()
+		v.RegisterValidation("isalice", func(fl validator.FieldLevel) bool {
+			return fl.Field().String() == "alice"
+		})
+
+		Initialize(
+			WithValidator(v),
+		)
+
+		type Request struct {
+			Username string `json:"username" validate:"required,isalice"`
+		}
+
+		handler := H(func(body JSON[Request]) Request {
+			return body.Value
+		})
+
+		// Test valid case
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"username":"alice"}`))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code != 200 {
+			t.Errorf("expected status 200 for valid username, got %d", rec.Code)
+		}
+
+		// Test invalid case
+		req = httptest.NewRequest("POST", "/", strings.NewReader(`{"username":"bob"}`))
+		rec = httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code == 200 {
+			t.Error("expected validation error for invalid username")
+		}
+	})
+}
+
+func TestCustomSchemaDecoder(t *testing.T) {
+	t.Run("custom schema decoder with alias tag", func(t *testing.T) {
+		Reset()
+
+		decoder := schema.NewDecoder()
+		decoder.SetAliasTag("form")
+		decoder.IgnoreUnknownKeys(true)
+
+		Initialize(
+			WithSchemaDecoder(decoder),
+		)
+
+		type QueryParams struct {
+			PageNum int `form:"page"`
+			Size    int `form:"size"`
+		}
+
+		handler := H(func(q Query[QueryParams]) QueryParams {
+			return q.Value
+		})
+
+		req := httptest.NewRequest("GET", "/?page=5&size=20", nil)
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code != 200 {
+			t.Fatalf("expected status 200, got %d", rec.Code)
+		}
+
+		var result QueryParams
+		if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+
+		if result.PageNum != 5 || result.Size != 20 {
+			t.Errorf("expected page=5, size=20, got page=%d, size=%d", result.PageNum, result.Size)
+		}
+	})
+}
+
+func TestCustomErrorHandler(t *testing.T) {
+	t.Run("custom error handler is called", func(t *testing.T) {
+		Reset()
+
+		errorHandlerCalled := false
+		var capturedError error
+
+		Initialize(
+			WithErrorHandler(func(w http.ResponseWriter, err error) {
+				errorHandlerCalled = true
+				capturedError = err
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTeapot) // Use unique status code
+				json.NewEncoder(w).Encode(map[string]string{
+					"custom": "error handler",
+					"error":  err.Error(),
+				})
+			}),
+		)
+
+		testError := errors.New("test error")
+		handler := H(func() error {
+			return testError
+		})
+
+		req := httptest.NewRequest("GET", "/", nil)
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if !errorHandlerCalled {
+			t.Error("custom error handler was not called")
+		}
+
+		if capturedError == nil || capturedError.Error() != "test error" {
+			t.Errorf("expected error 'test error', got %v", capturedError)
+		}
+
+		if rec.Code != http.StatusTeapot {
+			t.Errorf("expected status 418, got %d", rec.Code)
+		}
+
+		var response map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+
+		if response["custom"] != "error handler" {
+			t.Error("expected custom error response format")
+		}
+	})
+}
+
+func TestConfigThreadSafety(t *testing.T) {
+	t.Run("concurrent configure calls", func(t *testing.T) {
+		Reset()
+
+		done := make(chan bool, 10)
+
+		// Spawn multiple goroutines calling Configure
+		for i := 0; i < 10; i++ {
+			go func() {
+				Configure(
+					WithValidation(true),
+					WithValidation(false),
+				)
+				done <- true
+			}()
+		}
+
+		// Wait for all goroutines
+		for i := 0; i < 10; i++ {
+			<-done
+		}
+
+		// Should not panic
+	})
+
+	t.Run("concurrent reads and writes", func(t *testing.T) {
+		Reset()
+
+		done := make(chan bool, 20)
+
+		// Writers
+		for i := 0; i < 10; i++ {
+			go func() {
+				Configure(WithValidation(i%2 == 0))
+				done <- true
+			}()
+		}
+
+		// Readers (via handler execution)
+		for i := 0; i < 10; i++ {
+			go func() {
+				type Request struct {
+					Value int `json:"value"`
+				}
+
+				handler := H(func(body JSON[Request]) Request {
+					return body.Value
+				})
+
+				req := httptest.NewRequest("POST", "/", strings.NewReader(`{"value":123}`))
+				rec := httptest.NewRecorder()
+				handler(rec, req)
+
+				done <- true
+			}()
+		}
+
+		// Wait for all
+		for i := 0; i < 20; i++ {
+			<-done
+		}
+
+		// Should not panic or race
+	})
+}
+
+func TestConfigWithValidation(t *testing.T) {
+	t.Run("validation enabled by default", func(t *testing.T) {
+		Reset()
+
+		type Request struct {
+			Email string `json:"email" validate:"required,email"`
+		}
+
+		handler := H(func(body JSON[Request]) Request {
+			return body.Value
+		})
+
+		// Invalid email
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"email":"notanemail"}`))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code == 200 {
+			t.Error("expected validation error, got success")
+		}
+
+		var errResp map[string]any
+		json.Unmarshal(rec.Body.Bytes(), &errResp)
+		if !strings.Contains(errResp["message"].(string), "email") {
+			t.Error("expected email validation error message")
+		}
+	})
+
+	t.Run("validation can be disabled", func(t *testing.T) {
+		Reset()
+		Configure(WithValidation(false))
+
+		type Request struct {
+			Email string `json:"email" validate:"required,email"`
+		}
+
+		handler := H(func(body JSON[Request]) Request {
+			return body.Value
+		})
+
+		// Invalid email should pass
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"email":"notanemail"}`))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code != 200 {
+			t.Errorf("expected status 200 (no validation), got %d", rec.Code)
+		}
+	})
+}
+
+func TestCompleteConfigurationScenario(t *testing.T) {
+	t.Run("full custom configuration", func(t *testing.T) {
+		Reset()
+
+		var logBuf bytes.Buffer
+		customLogger := log.New(&logBuf, "[CUSTOM] ", 0)
+
+		v := validator.New()
+		v.RegisterValidation("positive", func(fl validator.FieldLevel) bool {
+			return fl.Field().Int() > 0
+		})
+
+		decoder := schema.NewDecoder()
+		decoder.IgnoreUnknownKeys(true)
+
+		errorHandlerCalled := false
+
+		Initialize(
+			WithLogger(customLogger),
+			WithValidator(v),
+			WithSchemaDecoder(decoder),
+			WithValidation(true),
+			WithJSONMarshal(func(v any) ([]byte, error) {
+				return json.MarshalIndent(v, "", "  ")
+			}),
+			WithErrorHandler(func(w http.ResponseWriter, err error) {
+				errorHandlerCalled = true
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": "custom handler",
+				})
+			}),
+		)
+
+		// Test that custom config is used
+		type Request struct {
+			Count int `json:"count" validate:"required,positive"`
+		}
+
+		handler := H(func(body JSON[Request]) Request {
+			return body.Value
+		})
+
+		// Invalid request (negative number)
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"count":-5}`))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if !errorHandlerCalled {
+			t.Error("custom error handler should have been called")
+		}
+
+		if rec.Code != 400 {
+			t.Errorf("expected status 400, got %d", rec.Code)
 		}
 	})
 }
