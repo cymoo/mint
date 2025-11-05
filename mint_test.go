@@ -1966,3 +1966,35 @@ func TestCompleteConfigurationScenario(t *testing.T) {
 		}
 	})
 }
+
+// ========== Bug Tests ==========
+
+func TestBugResultWithCodeAndErr(t *testing.T) {
+Reset()
+
+t.Run("Result with both Code and Err - bug demonstration", func(t *testing.T) {
+handler := H(func() Result[string] {
+return Result[string]{
+Code: 403,  // Forbidden
+Err:  errors.New("access denied"),
+Data: "should not be returned",
+}
+})
+
+rec := httptest.NewRecorder()
+req := httptest.NewRequest("GET", "/", nil)
+handler(rec, req)
+
+t.Logf("Status Code: %d", rec.Code)
+t.Logf("Response Body: %s", rec.Body.String())
+
+// The bug: status code will be 403 (from result.Code written first)
+// but handleError tries to write 500 (from inferStatusCode)
+// This causes inconsistency - status is 403 but error handling expects 500
+
+// Current behavior: First WriteHeader(403) succeeds, second is ignored with warning
+if rec.Code != 403 {
+t.Errorf("expected status 403 (first WriteHeader wins), got %d", rec.Code)
+}
+})
+}
