@@ -1967,34 +1967,85 @@ func TestCompleteConfigurationScenario(t *testing.T) {
 	})
 }
 
-// ========== Bug Tests ==========
+// ========== Bug Fix Tests ==========
 
-func TestBugResultWithCodeAndErr(t *testing.T) {
-Reset()
+// TestResultWithCodeAndErr tests the fix for the bug where Result[T] with both
+// Code and Err set would write status codes twice, causing inconsistency
+func TestResultWithCodeAndErr(t *testing.T) {
+	Reset()
+	
+	t.Run("Result with both Code and Err - should use explicit Code", func(t *testing.T) {
+		handler := H(func() Result[string] {
+			return Result[string]{
+				Code: 403,  // Forbidden - should be used
+				Err:  errors.New("access denied"),
+				Data: "should not be returned",
+			}
+		})
 
-t.Run("Result with both Code and Err - bug demonstration", func(t *testing.T) {
-handler := H(func() Result[string] {
-return Result[string]{
-Code: 403,  // Forbidden
-Err:  errors.New("access denied"),
-Data: "should not be returned",
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		handler(rec, req)
+
+		t.Logf("Status Code: %d", rec.Code)
+		t.Logf("Response Body: %s", rec.Body.String())
+		
+		// Fixed: Both HTTP status and error JSON code should be 403
+		if rec.Code != 403 {
+			t.Errorf("expected HTTP status 403, got %d", rec.Code)
+		}
+		
+		var errResp HTTPError
+		parseJSONResponse(t, rec.Body.Bytes(), &errResp)
+		if errResp.Code != 403 {
+			t.Errorf("expected error code 403 in JSON, got %d", errResp.Code)
+		}
+	})
+	
+	t.Run("Result with only Err - should infer code", func(t *testing.T) {
+		handler := H(func() Result[string] {
+			return Result[string]{
+				Err: errors.New("something went wrong"),
+			}
+		})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		handler(rec, req)
+		
+		// Should infer 500 from generic error
+		if rec.Code != 500 {
+			t.Errorf("expected HTTP status 500, got %d", rec.Code)
+		}
+		
+		var errResp HTTPError
+		parseJSONResponse(t, rec.Body.Bytes(), &errResp)
+		if errResp.Code != 500 {
+			t.Errorf("expected error code 500 in JSON, got %d", errResp.Code)
+		}
+	})
+	
+	t.Run("Result with Code and Data - no error", func(t *testing.T) {
+		handler := H(func() Result[map[string]string] {
+			return Result[map[string]string]{
+				Code: 201,
+				Data: map[string]string{"status": "created"},
+			}
+		})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		handler(rec, req)
+		
+		if rec.Code != 201 {
+			t.Errorf("expected HTTP status 201, got %d", rec.Code)
+		}
+		
+		var resp map[string]string
+		parseJSONResponse(t, rec.Body.Bytes(), &resp)
+		if resp["status"] != "created" {
+			t.Errorf("expected status=created in response")
+		}
+	})
 }
-})
 
-rec := httptest.NewRecorder()
-req := httptest.NewRequest("GET", "/", nil)
-handler(rec, req)
-
-t.Logf("Status Code: %d", rec.Code)
-t.Logf("Response Body: %s", rec.Body.String())
-
-// The bug: status code will be 403 (from result.Code written first)
-// but handleError tries to write 500 (from inferStatusCode)
-// This causes inconsistency - status is 403 but error handling expects 500
-
-// Current behavior: First WriteHeader(403) succeeds, second is ignored with warning
-if rec.Code != 403 {
-t.Errorf("expected status 403 (first WriteHeader wins), got %d", rec.Code)
-}
-})
-}

@@ -855,18 +855,26 @@ func handleResult(w http.ResponseWriter, result Result[any]) error {
 		WriteHeaders(w, result.Headers)
 	}
 
-	if result.Code != 0 {
-		w.WriteHeader(result.Code)
+	if result.Err != nil {
+		// If both Code and Err are set, use the explicit Code for the error response
+		if result.Code != 0 {
+			return handleErrorWithCode(w, result.Err, result.Code)
+		}
+		return handleError(w, result.Err)
 	}
 
-	if result.Err != nil {
-		return handleError(w, result.Err)
+	if result.Code != 0 {
+		w.WriteHeader(result.Code)
 	}
 
 	return handleCommonTypes(w, result.Data)
 }
 
 func handleError(w http.ResponseWriter, err error) error {
+	return handleErrorWithCode(w, err, 0)
+}
+
+func handleErrorWithCode(w http.ResponseWriter, err error, statusCode int) error {
 	if errorHandler() != nil {
 		errorHandler()(w, err)
 		return nil
@@ -880,6 +888,11 @@ func handleError(w http.ResponseWriter, err error) error {
 	httpErr := toHTTPError(err)
 	if httpErr == nil {
 		return nil
+	}
+
+	// If an explicit status code is provided, use it instead of the inferred one
+	if statusCode != 0 {
+		httpErr.Code = statusCode
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
