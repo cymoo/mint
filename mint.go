@@ -870,10 +870,15 @@ func handleResult(w http.ResponseWriter, result Result[any]) error {
 	return handleCommonTypes(w, result.Data)
 }
 
+// handleError handles error responses with automatic status code inference.
+// It delegates to handleErrorWithCode with statusCode=0 to use inferred codes.
 func handleError(w http.ResponseWriter, err error) error {
 	return handleErrorWithCode(w, err, 0)
 }
 
+// handleErrorWithCode handles error responses with an optional explicit status code.
+// If statusCode is 0, the status is inferred from the error type/message.
+// If statusCode is provided, it overrides the inferred status code.
 func handleErrorWithCode(w http.ResponseWriter, err error, statusCode int) error {
 	if errorHandler() != nil {
 		errorHandler()(w, err)
@@ -891,8 +896,13 @@ func handleErrorWithCode(w http.ResponseWriter, err error, statusCode int) error
 	}
 
 	// If an explicit status code is provided, use it instead of the inferred one
+	// Status codes should be in the valid HTTP range (100-599)
 	if statusCode != 0 {
-		httpErr.Code = statusCode
+		if statusCode < 100 || statusCode > 599 {
+			logger().Printf("warning: invalid HTTP status code %d, using inferred code %d", statusCode, httpErr.Code)
+		} else {
+			httpErr.Code = statusCode
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

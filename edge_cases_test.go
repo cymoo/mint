@@ -73,4 +73,28 @@ func TestResultEdgeCases(t *testing.T) {
 			t.Errorf("expected error code 500 in JSON, got %d", httpErr.Code)
 		}
 	})
+	
+	t.Run("Result with invalid status code and Err - should use inferred code", func(t *testing.T) {
+		handler := H(func() Result[string] {
+			return Result[string]{
+				Code: 9999,  // Invalid status code
+				Err:  errors.New("not found"),
+			}
+		})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		handler(rec, req)
+
+		// Should use inferred code (404 from "not found") instead of invalid 9999
+		if rec.Code != 404 {
+			t.Errorf("expected HTTP status 404 (inferred), got %d", rec.Code)
+		}
+		
+		var httpErr HTTPError
+		parseJSONResponse(t, rec.Body.Bytes(), &httpErr)
+		if httpErr.Code != 404 {
+			t.Errorf("expected error code 404 in JSON, got %d", httpErr.Code)
+		}
+	})
 }
