@@ -125,21 +125,18 @@ func newDefaultSchemaDecoder() *schema.Decoder {
 // newDefaultValidator creates a validator with sensible defaults
 func newDefaultValidator() *validator.Validate {
 	v := validator.New()
-	// Use json tag as field name for validation errors
+	// Use request-facing tags as field names for validation errors.
 	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
-		name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
-		if name == "-" {
-			return ""
+		for _, tag := range []string{"json", "schema", "form"} {
+			name := strings.SplitN(fld.Tag.Get(tag), ",", 2)[0]
+			if name == "-" {
+				return ""
+			}
+			if name != "" {
+				return name
+			}
 		}
-		if name != "" {
-			return name
-		}
-		// Fallback to form tag
-		name = strings.SplitN(fld.Tag.Get("form"), ",", 2)[0]
-		if name == "-" {
-			return ""
-		}
-		return name
+		return fld.Name
 	})
 	return v
 }
@@ -163,6 +160,8 @@ func Initialize(opts ...Option) {
 		for _, opt := range opts {
 			opt(cfg)
 		}
+		global.mu.Lock()
+		defer global.mu.Unlock()
 		global.config = cfg
 	})
 }
@@ -276,6 +275,8 @@ var (
 	readerType    = reflect.TypeOf((*io.Reader)(nil)).Elem()
 
 	handlerType        = reflect.TypeOf((*http.Handler)(nil)).Elem()
+	responderType      = reflect.TypeOf((*Responder)(nil)).Elem()
+	resultMarkerType   = reflect.TypeOf((*resultMarker)(nil)).Elem()
 	responseWriterType = reflect.TypeOf((*http.ResponseWriter)(nil)).Elem()
 	httpRequestType    = reflect.TypeOf((*http.Request)(nil))
 )
@@ -429,50 +430,41 @@ func (p *Path[T]) Extract(r *http.Request) error {
 		return NewMissingPathError(p.Key)
 	}
 
-	switch ptr := any(&p.Value).(type) {
-	case *string:
-		*ptr = pv
-	case *int:
-		if val, err := strconv.Atoi(pv); err != nil {
-			return NewPathConversionError(p.Key, pv, "int", err)
-		} else {
-			*ptr = val
+	val := reflect.ValueOf(&p.Value).Elem()
+	targetType := val.Type().String()
+
+	switch val.Kind() {
+	case reflect.String:
+		val.SetString(pv)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		parsed, err := strconv.ParseInt(pv, 10, val.Type().Bits())
+		if err != nil {
+			return NewPathConversionError(p.Key, pv, targetType, err)
 		}
-	case *int64:
-		if val, err := strconv.ParseInt(pv, 10, 64); err != nil {
-			return NewPathConversionError(p.Key, pv, "int64", err)
-		} else {
-			*ptr = val
+		val.SetInt(parsed)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		parsed, err := strconv.ParseUint(pv, 10, val.Type().Bits())
+		if err != nil {
+			return NewPathConversionError(p.Key, pv, targetType, err)
 		}
-	case *uint:
-		if val, err := strconv.ParseUint(pv, 10, 0); err != nil {
-			return NewPathConversionError(p.Key, pv, "uint", err)
-		} else {
-			*ptr = uint(val)
+		val.SetUint(parsed)
+	case reflect.Float32, reflect.Float64:
+		parsed, err := strconv.ParseFloat(pv, val.Type().Bits())
+		if err != nil {
+			return NewPathConversionError(p.Key, pv, targetType, err)
 		}
-	case *uint64:
-		if val, err := strconv.ParseUint(pv, 10, 64); err != nil {
-			return NewPathConversionError(p.Key, pv, "uint64", err)
-		} else {
-			*ptr = val
+		val.SetFloat(parsed)
+	case reflect.Bool:
+		parsed, err := strconv.ParseBool(pv)
+		if err != nil {
+			return NewPathConversionError(p.Key, pv, targetType, err)
 		}
-	case *float64:
-		if val, err := strconv.ParseFloat(pv, 64); err != nil {
-			return NewPathConversionError(p.Key, pv, "float64", err)
-		} else {
-			*ptr = val
-		}
-	case *bool:
-		if val, err := strconv.ParseBool(pv); err != nil {
-			return NewPathConversionError(p.Key, pv, "bool", err)
-		} else {
-			*ptr = val
-		}
+		val.SetBool(parsed)
 	default:
 		return &ExtractError{
 			Type:    "unsupported_type",
 			Field:   p.Key,
-			Message: fmt.Sprintf("Unsupported path parameter type: %T", &p.Value),
+			Message: fmt.Sprintf("Unsupported path parameter type: %s", targetType),
 		}
 	}
 	return nil
@@ -520,12 +512,20 @@ func (rw *ResponseWriter) Write(b []byte) (int, error) {
 	return rw.ResponseWriter.Write(b)
 }
 
+func (rw *ResponseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 type resultMarker interface {
 	isResultType() bool
 	toResult() Result[any]
 }
 
 func H(fn any) http.HandlerFunc {
+	if fn == nil {
+		log.Panic("H: handler must be a function, got <nil>")
+	}
+
 	fnVal := reflect.ValueOf(fn)
 	fnType := fnVal.Type()
 
@@ -536,6 +536,9 @@ func H(fn any) http.HandlerFunc {
 	paramTypes := make([]reflect.Type, fnType.NumIn())
 	for i := 0; i < fnType.NumIn(); i++ {
 		paramTypes[i] = fnType.In(i)
+		if !isSupportedParamType(paramTypes[i]) {
+			log.Panicf("H: unsupported parameter type %s", paramTypes[i].String())
+		}
 	}
 
 	numOut := fnType.NumOut()
@@ -546,8 +549,8 @@ func H(fn any) http.HandlerFunc {
 	if numOut == 1 {
 		rt := fnType.Out(0)
 		if rt.Kind() == reflect.Interface {
-			if !rt.Implements(errorType) && !rt.Implements(handlerType) && !rt.Implements(readerType) {
-				log.Panic("H: interface return type must implement error, http.Handler or io.Reader")
+			if !isSupportedSingleInterfaceReturn(rt) {
+				log.Panic("H: interface return type must implement error, http.Handler, io.Reader or Responder")
 			}
 		}
 	}
@@ -556,10 +559,10 @@ func H(fn any) http.HandlerFunc {
 		rt1 := fnType.Out(0)
 		rt2 := fnType.Out(1)
 
-		if rt1.Kind() == reflect.Interface {
-			log.Panic("H: first return value cannot be an interface when returning two values")
+		if rt1.Kind() == reflect.Interface && !isSupportedDataInterfaceReturn(rt1) {
+			log.Panic("H: first return interface must implement http.Handler, io.Reader or Responder")
 		}
-		if rt1.Implements(reflect.TypeOf((*resultMarker)(nil)).Elem()) {
+		if rt1.Implements(resultMarkerType) {
 			log.Panicf("H: first return value cannot be Result when returning two values")
 		}
 
@@ -578,7 +581,7 @@ func H(fn any) http.HandlerFunc {
 
 		for i, paramType := range paramTypes {
 			switch {
-			case reflect.PointerTo(paramType).Implements(extractorType):
+			case isExtractorParam(paramType):
 				paramVal := reflect.New(paramType).Elem()
 				extractor := paramVal.Addr().Interface().(Extractor)
 
@@ -649,11 +652,40 @@ func H(fn any) http.HandlerFunc {
 	}
 }
 
+func isExtractorParam(paramType reflect.Type) bool {
+	return reflect.PointerTo(paramType).Implements(extractorType)
+}
+
+func isSupportedParamType(paramType reflect.Type) bool {
+	return isExtractorParam(paramType) ||
+		paramType == httpRequestType ||
+		(paramType.Kind() == reflect.Interface && paramType.Implements(responseWriterType))
+}
+
+func isSupportedSingleInterfaceReturn(rt reflect.Type) bool {
+	return rt.Implements(errorType) ||
+		rt.Implements(handlerType) ||
+		rt.Implements(readerType) ||
+		rt.Implements(responderType)
+}
+
+func isSupportedDataInterfaceReturn(rt reflect.Type) bool {
+	return rt.Implements(handlerType) ||
+		rt.Implements(readerType) ||
+		rt.Implements(responderType)
+}
+
 func WriteHeaders(w http.ResponseWriter, headers http.Header) {
 	for key, values := range headers {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
+	}
+}
+
+func setHeaderIfMissing(w http.ResponseWriter, key, value string) {
+	if w.Header().Get(key) == "" {
+		w.Header().Set(key, value)
 	}
 }
 
@@ -827,25 +859,25 @@ func handleCommonTypes(w http.ResponseWriter, data any) error {
 
 	switch v := data.(type) {
 	case string:
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		setHeaderIfMissing(w, "Content-Type", "text/plain; charset=utf-8")
 		_, err := fmt.Fprint(w, v)
 		return err
 	case StatusCode:
 		w.WriteHeader(int(v))
 		return nil
 	case []byte:
-		w.Header().Set("Content-Type", "application/octet-stream")
+		setHeaderIfMissing(w, "Content-Type", "application/octet-stream")
 		_, err := w.Write(v)
 		return err
 	case HTML, template.HTML:
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		setHeaderIfMissing(w, "Content-Type", "text/html; charset=utf-8")
 		_, err := fmt.Fprint(w, v)
 		return err
 	case io.Reader:
 		_, err := io.Copy(w, v)
 		return err
 	default:
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		setHeaderIfMissing(w, "Content-Type", "application/json; charset=utf-8")
 		return jsonEncode(w, data)
 	}
 }
@@ -855,18 +887,22 @@ func handleResult(w http.ResponseWriter, result Result[any]) error {
 		WriteHeaders(w, result.Headers)
 	}
 
-	if result.Code != 0 {
-		w.WriteHeader(result.Code)
+	if result.Err != nil {
+		return handleErrorWithCode(w, result.Err, result.Code)
 	}
 
-	if result.Err != nil {
-		return handleError(w, result.Err)
+	if result.Code != 0 {
+		w.WriteHeader(result.Code)
 	}
 
 	return handleCommonTypes(w, result.Data)
 }
 
 func handleError(w http.ResponseWriter, err error) error {
+	return handleErrorWithCode(w, err, 0)
+}
+
+func handleErrorWithCode(w http.ResponseWriter, err error, codeOverride int) error {
 	if errorHandler() != nil {
 		errorHandler()(w, err)
 		return nil
@@ -882,14 +918,22 @@ func handleError(w http.ResponseWriter, err error) error {
 		return nil
 	}
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if codeOverride != 0 {
+		httpErr = &HTTPError{
+			Code:    codeOverride,
+			Err:     inferErrorType(codeOverride),
+			Message: httpErr.Message,
+		}
+	}
+
+	setHeaderIfMissing(w, "Content-Type", "application/json; charset=utf-8")
 
 	if !statusWritten {
 		w.WriteHeader(httpErr.Code)
 	}
 
 	if httpErr.Code >= 500 {
-		log.Println(httpErr.Error())
+		logger().Println(httpErr.Error())
 	}
 
 	return jsonEncode(w, httpErr)
@@ -1061,8 +1105,9 @@ func extractPatternNames(pattern string) []string {
 			}
 			inParam = false
 			depth--
-			if currentName != "" {
-				names = append(names, currentName)
+			name := strings.TrimSuffix(currentName, "...")
+			if name != "" && name != "$" {
+				names = append(names, name)
 			}
 		} else if inParam {
 			currentName += string(char)
