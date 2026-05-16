@@ -368,6 +368,41 @@ func TestPathExtractor(t *testing.T) {
 			t.Fatal("expected error for invalid bool")
 		}
 	})
+
+	t.Run("named int path value", func(t *testing.T) {
+		type UserID int
+
+		req := createRequestWithPattern("GET", "/users/42", "/users/{id}")
+		req.SetPathValue("id", "42")
+
+		var p Path[UserID]
+		p.SetKey("id")
+		err := p.Extract(req)
+		if err != nil {
+			t.Fatalf("Extract failed: %v", err)
+		}
+		if p.Value != UserID(42) {
+			t.Errorf("expected Value=42, got %d", p.Value)
+		}
+	})
+
+	t.Run("catch-all path value", func(t *testing.T) {
+		handler := H(func(path Path[string]) string {
+			return path.Value
+		})
+		rec := httptest.NewRecorder()
+		req := createRequestWithPattern("GET", "/files/docs/readme.md", "/files/{path...}")
+		req.SetPathValue("path", "docs/readme.md")
+
+		handler(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected status 200, got %d", rec.Code)
+		}
+		if rec.Body.String() != "docs/readme.md" {
+			t.Errorf("expected catch-all path, got %q", rec.Body.String())
+		}
+	})
 }
 
 // ========== Handler Tests ==========
@@ -614,6 +649,40 @@ func TestH_ErrorHandling(t *testing.T) {
 		}
 	})
 
+	t.Run("return http.Handler and error - serves handler", func(t *testing.T) {
+		inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusAccepted)
+			w.Write([]byte("delegated"))
+		})
+		handler := H(func() (http.Handler, error) {
+			return inner, nil
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		handler(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Errorf("expected status 202, got %d", rec.Code)
+		}
+		if rec.Body.String() != "delegated" {
+			t.Errorf("unexpected body: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("return http.Handler and error - error wins", func(t *testing.T) {
+		inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusAccepted)
+		})
+		handler := H(func() (http.Handler, error) {
+			return inner, errors.New("something failed")
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		handler(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("expected status 500, got %d", rec.Code)
+		}
+	})
+
 	t.Run("return data and error - error only", func(t *testing.T) {
 		handler := H(func() (string, error) {
 			return "", errors.New("failed")
@@ -709,6 +778,27 @@ func TestH_ResultType(t *testing.T) {
 		}
 	})
 
+	t.Run("Err result keeps status and body code consistent", func(t *testing.T) {
+		handler := H(func() Result[User] {
+			return Err[User](400, errors.New("name is required"))
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/", nil)
+		handler(rec, req)
+
+		if rec.Code != 400 {
+			t.Errorf("expected status 400, got %d", rec.Code)
+		}
+		var httpErr HTTPError
+		parseJSONResponse(t, rec.Body.Bytes(), &httpErr)
+		if httpErr.Code != 400 {
+			t.Errorf("expected body code 400, got %d", httpErr.Code)
+		}
+		if httpErr.Err != "bad_request" {
+			t.Errorf("expected error type bad_request, got %s", httpErr.Err)
+		}
+	})
+
 	t.Run("Result with custom headers", func(t *testing.T) {
 		handler := H(func() Result[string] {
 			r := OK("test")
@@ -721,6 +811,24 @@ func TestH_ResultType(t *testing.T) {
 		handler(rec, req)
 		if rec.Header().Get("X-Custom-Header") != "value" {
 			t.Errorf("expected X-Custom-Header")
+		}
+	})
+
+	t.Run("Result preserves custom content type", func(t *testing.T) {
+		handler := H(func() Result[[]byte] {
+			return Result[[]byte]{
+				Headers: http.Header{
+					"Content-Type": []string{"text/csv"},
+				},
+				Data: []byte("id,name\n1,Alice\n"),
+			}
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		handler(rec, req)
+
+		if rec.Header().Get("Content-Type") != "text/csv" {
+			t.Errorf("expected Content-Type=text/csv, got %s", rec.Header().Get("Content-Type"))
 		}
 	})
 
@@ -1060,6 +1168,14 @@ func TestResponseWriter(t *testing.T) {
 			t.Errorf("expected statusCode=200, got %d", rw.statusCode)
 		}
 	})
+
+	t.Run("unwrap returns underlying writer", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		rw := &ResponseWriter{ResponseWriter: rec}
+		if rw.Unwrap() != rec {
+			t.Error("expected Unwrap to return underlying writer")
+		}
+	})
 }
 
 // ========== Responder Interface Tests ==========
@@ -1085,6 +1201,22 @@ func TestResponderInterface(t *testing.T) {
 		t.Errorf("expected status 418, got %d", rec.Code)
 	}
 	if rec.Body.String() != "I'm a teapot" {
+		t.Errorf("unexpected body: %s", rec.Body.String())
+	}
+}
+
+func TestResponderInterfaceReturn(t *testing.T) {
+	handler := H(func() Responder {
+		return CustomResponder{statusCode: 201, body: "created"}
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	handler(rec, req)
+
+	if rec.Code != 201 {
+		t.Errorf("expected status 201, got %d", rec.Code)
+	}
+	if rec.Body.String() != "created" {
 		t.Errorf("unexpected body: %s", rec.Body.String())
 	}
 }
@@ -1337,15 +1469,12 @@ func TestH_Panics(t *testing.T) {
 	})
 
 	t.Run("panic on unsupported parameter type", func(t *testing.T) {
-		handler := H(func(x int) {})
 		defer func() {
 			if r := recover(); r == nil {
 				t.Error("expected panic")
 			}
 		}()
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		handler(rec, req)
+		H(func(x int) {})
 	})
 }
 
@@ -1883,6 +2012,36 @@ func TestConfigWithValidation(t *testing.T) {
 		json.Unmarshal(rec.Body.Bytes(), &errResp)
 		if !strings.Contains(errResp["message"].(string), "email") {
 			t.Error("expected email validation error message")
+		}
+	})
+
+	t.Run("validation uses schema tag field names", func(t *testing.T) {
+		Reset()
+
+		type Request struct {
+			MaxResults int `schema:"max_results" validate:"lte=10"`
+		}
+
+		handler := H(func(q Query[Request]) Request {
+			return q.Value
+		})
+
+		req := httptest.NewRequest("GET", "/?max_results=20", nil)
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code != 400 {
+			t.Fatalf("expected validation error, got status %d", rec.Code)
+		}
+
+		var errResp map[string]any
+		parseJSONResponse(t, rec.Body.Bytes(), &errResp)
+		message := errResp["message"].(string)
+		if !strings.Contains(message, "max_results") {
+			t.Errorf("expected schema field name in validation message, got %q", message)
+		}
+		if strings.Contains(message, "MaxResults") {
+			t.Errorf("did not expect Go field name in validation message, got %q", message)
 		}
 	})
 

@@ -574,7 +574,7 @@ If you don't call `Initialize()` or `Configure()`, Mint uses sensible defaults:
 {
     SchemaDecoder:     schema.NewDecoder() with IgnoreUnknownKeys(true),
     EnableValidation:  true,
-    Validator:         validator with JSON/form tag support,
+    Validator:         validator with JSON/schema/form tag support,
     Logger:            log.Default(),
     JSONMarshalFunc:   json.Marshal,
     JSONUnmarshalFunc: json.Unmarshal,
