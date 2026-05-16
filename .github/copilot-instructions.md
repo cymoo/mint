@@ -29,8 +29,8 @@ Error handling flows through `handleError` and `toHTTPError`. Prefer returning `
 
 ## Key conventions
 
-- Handler functions passed to `H` may return zero, one, or two values only. Two-value returns must be `(non-interface, error)`, and the first return value cannot be `Result[T]`.
-- Handler parameters are limited to built-in/custom extractors, `http.ResponseWriter`, and `*http.Request`; unsupported parameter types panic during request handling.
+- Handler functions passed to `H` may return zero, one, or two values only. Two-value returns must be `(T, error)` where T is a concrete type, `http.Handler`, `io.Reader`, or `Responder`; the first return value cannot be `Result[T]`.
+- Handler parameters are limited to built-in/custom extractors, `http.ResponseWriter`, and `*http.Request`; unsupported parameter types panic at `H()` registration time.
 - Custom extractors should define `Extract(*http.Request) error` on a pointer receiver so `reflect.PointerTo(paramType).Implements(extractorType)` detects them when handlers accept the non-pointer extractor value.
 - Use `Result[T]`, `OK[T]`, and `Err[T]` when a handler needs custom status codes, headers, or a typed error result.
 - Use `json` tags for JSON bodies and validation field names. Use `schema` tags for query/form decoding; the default validator also uses `schema` tags when choosing validation field names.

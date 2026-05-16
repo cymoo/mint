@@ -532,6 +532,9 @@ func H(fn any) http.HandlerFunc {
 	if fnType.Kind() != reflect.Func {
 		log.Panicf("H: handler must be a function, got %T", fn)
 	}
+	if fnVal.IsNil() {
+		log.Panic("H: handler function must not be nil")
+	}
 
 	paramTypes := make([]reflect.Type, fnType.NumIn())
 	for i := 0; i < fnType.NumIn(); i++ {
@@ -642,9 +645,16 @@ func H(fn any) http.HandlerFunc {
 			}
 
 			rv := results[0].Interface()
-			err := results[1].Interface()
+			errVal := results[1].Interface()
 
-			e := handleTwoResults(rw, rv, err)
+			if errVal == nil {
+				if handler, ok := rv.(http.Handler); ok {
+					handler.ServeHTTP(rw, r)
+					return
+				}
+			}
+
+			e := handleTwoResults(rw, rv, errVal)
 			if e != nil {
 				logger().Printf("failed to write response: %v", e)
 			}

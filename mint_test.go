@@ -649,6 +649,40 @@ func TestH_ErrorHandling(t *testing.T) {
 		}
 	})
 
+	t.Run("return http.Handler and error - serves handler", func(t *testing.T) {
+		inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusAccepted)
+			w.Write([]byte("delegated"))
+		})
+		handler := H(func() (http.Handler, error) {
+			return inner, nil
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		handler(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Errorf("expected status 202, got %d", rec.Code)
+		}
+		if rec.Body.String() != "delegated" {
+			t.Errorf("unexpected body: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("return http.Handler and error - error wins", func(t *testing.T) {
+		inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusAccepted)
+		})
+		handler := H(func() (http.Handler, error) {
+			return inner, errors.New("something failed")
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		handler(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("expected status 500, got %d", rec.Code)
+		}
+	})
+
 	t.Run("return data and error - error only", func(t *testing.T) {
 		handler := H(func() (string, error) {
 			return "", errors.New("failed")
