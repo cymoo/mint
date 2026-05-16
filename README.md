@@ -1,737 +1,489 @@
 # Mint
 
-A lightweight, type-safe Go web framework built on top of `net/http` with automatic parameter extraction and elegant response handling.
+> A small, type-safe Go web toolkit built on top of `net/http`.
 
-## ✨ Features
+Mint is **not a framework**. It does not give you a router, a middleware chain,
+or a request context type. What it gives you is one thing: a way to write HTTP
+handlers as plain, type-safe Go functions.
 
-- 🚀 **Zero Learning Curve** - Built on standard `net/http`, no custom router
-- 🎯 **Automatic Parameter Extraction** - JSON body, query params, form data, and path parameters
-- ✅ **Automatic Validation** - Built-in validation with user-friendly error messages
-- 🔒 **Type-Safe** - Leverages Go generics for compile-time type safety
-- 📦 **Flexible Response Handling** - Return any type: structs, strings, HTML, status codes, or custom results
-- ⚡ **Minimal Boilerplate** - Write handlers as simple functions
-- 🛠️ **Customizable** - Configure JSON encoding, schema decoding, and error handling
-- 🪶 **Lightweight** - No dependencies beyond gorilla/schema for form parsing
+```go
+func GetUser(id m.Path[int]) (User, error) { ... }
+func CreateUser(body m.JSON[NewUser]) m.Result[User] { ... }
+func Search(q m.Query[Filter]) []Result { ... }
+```
 
-## 📦 Installation
+You keep `http.ServeMux`. You keep `http.HandlerFunc`. Mint is a thin adapter
+in between that does parameter extraction, validation, and response
+serialization for you — and gets out of the way for everything else.
 
 ```bash
 go get github.com/cymoo/mint
 ```
 
-**Requirements:** Go 1.23+ (for enhanced routing patterns)
+Requires **Go 1.23+** (for the enhanced routing patterns in `net/http`).
 
-## 🚀 Quick Start
+---
+
+## Table of Contents
+
+- [Hello, Mint](#hello-mint)
+- [Core idea: `H(handler)`](#core-idea-hhandler)
+- [Extracting input](#extracting-input)
+  - [`JSON[T]`](#jsont)
+  - [`Query[T]`](#queryt)
+  - [`Form[T]`](#formt)
+  - [`Path[T]`](#patht)
+  - [`Header[T]`](#headert)
+  - [`Cookie[T]`](#cookiet)
+  - [Raw access](#raw-access)
+  - [Custom extractors](#custom-extractors)
+- [Returning output](#returning-output)
+- [Errors](#errors)
+- [Validation](#validation)
+- [Streaming, SSE, hijack](#streaming-sse-hijack)
+- [Configuration](#configuration)
+- [Pitfalls & limitations](#pitfalls--limitations)
+- [What Mint does not do](#what-mint-does-not-do)
+
+---
+
+## Hello, Mint
 
 ```go
 package main
 
 import (
-	"net/http"
+    "net/http"
 
-	"github.com/cymoo/mint"
+    m "github.com/cymoo/mint"
 )
 
-type User struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
-}
-
-type UpdateUserRequest struct {
-	Name string `json:"name" validate:"required,min=2,max=50"`
-}
-
-// Simple string response
-func handleHome() string {
-	return "Hello, World!"
-}
-
-// JSON response with path parameter
-func handleGetUser(id m.Path[int]) (User, error) {
-	// id.Value contains the parsed integer
-	return User{ID: id.Value, Name: "Alice"}, nil
-}
-
-// Result[T] for full control over the response with multiple parameters with different types
-func handleUpdateUser(id m.Path[int], req m.JSON[UpdateUserRequest]) m.Result[*User] {
-	return m.Result[*User]{
-		Data: &User{ID: id.Value, Name: req.Value.Name},
-		Code: http.StatusOK,
-		Headers: http.Header{
-			"X-Custom-Header": []string{"foo"},
-		},
-	}
+func hello(name m.Query[struct {
+    Name string `schema:"name"`
+}]) string {
+    if name.Value.Name == "" {
+        return "Hello, world!"
+    }
+    return "Hello, " + name.Value.Name + "!"
 }
 
 func main() {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/", m.H(handleHome))
-	mux.HandleFunc("GET /users/{id}", m.H(handleGetUser))
-	mux.HandleFunc("PUT /users/{id}", m.H(handleUpdateUser))
-
-	err := http.ListenAndServe(":8080", mux)
-	if err != nil {
-		panic(err)
-	}
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /hello", m.H(hello))
+    http.ListenAndServe(":8080", mux)
 }
 ```
 
-See [_examples](./_examples/) for more detailed examples.
+That's it. No `Engine`, no `Router`, no `app := mint.New()`.
 
-## 📚 Core Concepts
+---
 
-### The `H` Function
+## Core idea: `H(handler)`
 
-`m.H()` wraps your handler functions, enabling automatic parameter extraction and response handling:
+`m.H` adapts any function whose **parameters and return values** Mint
+understands into an `http.HandlerFunc`:
 
-```go
-mux.HandleFunc("POST /users", m.H(handleCreateUser))
+```
+http.HandleFunc(pattern, m.H(yourFunc))
 ```
 
-### Parameter Extractors
+### Allowed parameters
 
-Extract data from requests using type-safe extractors:
+| Parameter type            | What it gives you                              |
+|---------------------------|------------------------------------------------|
+| `m.JSON[T]`               | Decoded + validated JSON body                  |
+| `m.Query[T]`              | Decoded + validated query string               |
+| `m.Form[T]`               | Decoded + validated form (`application/x-www-form-urlencoded`) |
+| `m.Path[T]`               | A single typed path parameter                  |
+| `m.Header[T]`             | Headers mapped onto a struct via `header` tags |
+| `m.Cookie[T]`             | Cookies mapped onto a struct via `cookie` tags |
+| `http.ResponseWriter`     | The raw writer (wrapped, see below)            |
+| `*http.Request`           | The raw request                                |
+| any type implementing `Extractor` | Your own extractor                      |
 
-| Extractor    | Purpose           | Example                              |
-| ------------ | ----------------- | ------------------------------------ |
-| `m.Path[T]`  | Path parameters   | `{id}` → `m.Path[int]`               |
-| `m.JSON[T]`  | JSON request body | `m.JSON[CreateUserRequest]`          |
-| `m.Query[T]` | Query parameters  | `?page=1` → `m.Query[Pagination]`    |
-| `m.Form[T]`  | Form data         | `username=...` → `m.Form[LoginForm]` |
+Mint **panics at registration time** if you use anything else as a
+parameter. Bad handlers blow up at startup, not at request time.
 
-### Response Types
+### Allowed return shapes
 
-Return values are automatically handled:
+| Return                       | Behavior                                             |
+|------------------------------|------------------------------------------------------|
+| _none_                       | 200, empty body                                       |
+| `T`                          | JSON-encoded (or special-cased below)                |
+| `error`                      | Error pipeline (see [Errors](#errors))               |
+| `(T, error)`                 | Common case: data on success, error on failure       |
+| `m.Result[T]`                | Full control: code, headers, body, or error         |
+| `m.StatusCode`               | Empty body with this status                          |
+| `m.HTML`                     | `Content-Type: text/html`                            |
+| `[]byte`                     | `Content-Type: application/octet-stream`             |
+| `io.Reader`                  | Streamed verbatim                                    |
+| `http.Handler`               | Delegated to                                         |
+| any type implementing `Responder` | Calls `Respond(w, r)`                           |
 
-| Return Type                | Result                              |
-| -------------------------- | ----------------------------------- |
-| `string`                   | `text/plain` response               |
-| `m.HTML`                   | `text/html` response                |
-| `struct` / `map` / `slice` | `application/json` response         |
-| `m.StatusCode`             | HTTP status code only               |
-| `[]byte`                   | `application/octet-stream` response |
-| `m.Result[T]`              | Custom status code + headers + data |
-| `error`                    | Automatic error handling            |
-| `(T, error)`               | Data or error pattern               |
+Any other concrete type is JSON-encoded. The first value of `(T, error)`
+**cannot** be `Result[U]` — pick one style or the other.
 
-## 📖 Usage Examples
+---
 
-### Path Parameters
+## Extracting input
 
-Extract typed path parameters from URLs:
+All extractors are tiny generic wrappers. Their decoded value lives in
+`.Value`.
 
-```go
-// Single parameter
-mux.HandleFunc("GET /users/{id}", m.H(func(id m.Path[int]) (User, error) {
-    user, ok := getUser(id.Value)
-    if !ok {
-        return User{}, &m.HTTPError{
-            Code:    404,
-            Err:     "not_found",
-            Message: "user not found",
-        }
-    }
-    return user, nil
-}))
-
-// Multiple parameters with different types
-mux.HandleFunc("GET /calc/{a}/{b}", m.H(func(a m.Path[int], b m.Path[float64]) map[string]any {
-    return map[string]any{
-        "sum": float64(a.Value) + b.Value,
-    }
-}))
-```
-
-**Supported types:** `string`, `int`, `int64`, `uint`, `uint64`, `float64`, `bool`
-
-### JSON Request Body
-
-Parse JSON request bodies automatically:
+### `JSON[T]`
 
 ```go
-type CreateUserRequest struct {
-    Name  string `json:"name"`
-    Email string `json:"email"`
+type CreateUser struct {
+    Name  string `json:"name"  validate:"required,min=2"`
+    Email string `json:"email" validate:"required,email"`
 }
 
-mux.HandleFunc("POST /users", m.H(func(body m.JSON[CreateUserRequest]) m.Result[User] {
-    user := User{
-        Name:  body.Value.Name,
-        Email: body.Value.Email,
-    }
-    
-    return m.Result[User]{
-        Code: 201,
-        Headers: http.Header{
-            "Location": []string{"/users/" + user.ID},
-        },
-        Data: user,
-    }
-}))
-```
-
-### Query Parameters
-
-Extract and parse query parameters:
-
-```go
-type Pagination struct {
-    Page  int    `schema:"page"`
-    Limit int    `schema:"limit"`
-    Sort  string `schema:"sort"`
-}
-
-mux.HandleFunc("GET /users", m.H(func(q m.Query[Pagination]) []User {
-    // Access via q.Value.Page, q.Value.Limit, etc.
-    return getUsers(q.Value.Page, q.Value.Limit)
-}))
-```
-
-### Form Data
-
-Parse form submissions:
-
-```go
-type LoginForm struct {
-    Username string `schema:"username"`
-    Password string `schema:"password"`
-}
-
-mux.HandleFunc("POST /login", m.H(func(form m.Form[LoginForm]) map[string]string {
-    // Authenticate user
-    token := authenticate(form.Value.Username, form.Value.Password)
-    return map[string]string{"token": token}
-}))
-```
-
-### Custom Response with Headers
-
-Use `m.Result[T]` for full control over the response:
-
-```go
-mux.HandleFunc("GET /download", m.H(func() m.Result[Data] {
-    return m.Result[Data]{
-        Code: 200,
-        Headers: http.Header{
-            "Content-Disposition": []string{"attachment; filename=data.json"},
-            "X-Custom-Header":     []string{"value"},
-        },
-        Data: myData,
-    }
-}))
-```
-
-### Error Handling
-
-Multiple ways to handle errors:
-
-```go
-// 1. Return generic error (status inferred from message)
-func handler() error {
-    return errors.New("not found") // → 404
-}
-
-// 2. Return custom HTTP error
-func handler() error {
-    return &m.HTTPError{
-        Code:    400,
-        Err:     "validation_error",
-        Message: "invalid input",
-    }
-}
-
-// 3. Two-value return pattern
-func handler(id m.Path[int]) (User, error) {
-    user, err := getUser(id.Value)
-    if err != nil {
-        return User{}, err
-    }
-    return user, nil
-}
-
-// 4. Result with error
-func handler() m.Result[User] {
-    return m.Err[User](400, errors.New("bad request"))
+func createUser(body m.JSON[CreateUser]) (User, error) {
+    return saveUser(body.Value), nil
 }
 ```
 
-### Direct HTTP Access
+- Body is automatically size-limited (default 5 MiB; configurable).
+- Empty body → `empty_body` error.
+- Malformed JSON → 400 with `Err: "json_decode_error"`.
+- Validation tags are honored.
 
-When you need full control, access raw HTTP primitives:
-
-```go
-mux.HandleFunc("GET /custom", m.H(func(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("X-Custom", "header")
-    w.WriteHeader(200)
-    w.Write([]byte("custom response"))
-}))
-```
-
-## Custom Extractors Guide
-
-Custom extractors allow you to extend the framework to handle any type of request data. Here's how to create your own:
-
-### Basic Structure
-
-Implement the `Extractor` interface with an `Extract` method:
+### `Query[T]`
 
 ```go
-type BearerToken struct {
-    Token string
+type Filter struct {
+    Page  int    `schema:"page"  validate:"gte=1"`
+    Limit int    `schema:"limit" validate:"gte=1,lte=100"`
+    Q     string `schema:"q"`
 }
 
-func (bt *BearerToken) Extract(r *http.Request) error {
-    const bearerPrefix = "Bearer "
-    auth := r.Header.Get("Authorization")
-    
-    if strings.HasPrefix(auth, bearerPrefix) {
-        bt.Token = strings.TrimSpace(auth[len(bearerPrefix):])
-    }
-    
-    if bt.Token == "" {
-        return &m.ExtractError{
-            Type:    "invalid_authorization",
-            Message: "Authorization header must be: Bearer <token>",
-        }
-    }
-    
+func search(f m.Query[Filter]) []Hit { ... }
+```
+
+Query strings are decoded with `gorilla/schema` using `schema` tags.
+
+### `Form[T]`
+
+```go
+type Login struct {
+    Username string `schema:"username" validate:"required"`
+    Password string `schema:"password" validate:"required,min=8"`
+}
+
+func login(f m.Form[Login]) error { ... }
+```
+
+Same conventions as `Query[T]`, but reads `r.Form` after `ParseForm`.
+
+### `Path[T]`
+
+`Path[T]` extracts a single typed path parameter:
+
+```go
+mux.HandleFunc("GET /users/{id}", m.H(func(id m.Path[int]) User { ... }))
+mux.HandleFunc("GET /files/{name}", m.H(func(name m.Path[string]) File { ... }))
+```
+
+Supported types: `string`, `int`, `int8`, `int16`, `int32`, `int64`,
+`uint`–`uint64`, `float32`, `float64`, `bool`.
+
+> ⚠️ **Path binding is positional, not by name.** Path params are matched to
+> handler parameters **in order**. For
+> `mux.HandleFunc("GET /users/{uid}/posts/{pid}", m.H(handler))`, the **first**
+> `Path[T]` parameter in `handler` receives `{uid}`, the **second** receives
+> `{pid}` — regardless of the Go variable names you choose.
+>
+> ```go
+> // pid gets {uid}, uid gets {pid}. Don't do this:
+> func bad(pid m.Path[int], uid m.Path[int]) { ... }
+>
+> // Match argument order to URL order:
+> func good(uid m.Path[int], pid m.Path[int]) { ... }
+> ```
+
+If you declare more `Path[T]` parameters than the route pattern provides,
+Mint returns **400** at request time (and logs a one-time warning).
+
+### `Header[T]`
+
+```go
+type AuthHeaders struct {
+    Token     string `header:"Authorization" validate:"required"`
+    RequestID string `header:"X-Request-ID"`
+}
+
+func protected(h m.Header[AuthHeaders]) string {
+    return "hello, " + h.Value.Token
+}
+```
+
+Missing headers are zero values. Use `validate:"required"` if you need
+them present.
+
+### `Cookie[T]`
+
+```go
+type Session struct {
+    ID    string `cookie:"session_id" validate:"required"`
+    Theme string `cookie:"theme"`
+}
+
+func me(s m.Cookie[Session]) User { ... }
+```
+
+### Raw access
+
+You can mix extractors with `http.ResponseWriter` and `*http.Request`
+freely:
+
+```go
+func download(id m.Path[int], w http.ResponseWriter, r *http.Request) error {
+    f, err := openFile(id.Value)
+    if err != nil { return err }
+    defer f.Close()
+    http.ServeContent(w, r, f.Name(), f.ModTime(), f)
     return nil
 }
 ```
 
-### Key Features
+### Custom extractors
 
-- **Automatic Injection**: The framework automatically calls `Extract()` and injects the parsed value
-- **Error Handling**: Return `ExtractError` with clear type and message for client errors
-- **Type Safety**: Leverage Go's type system for validated, type-safe parameters
-
-### Usage in Handlers
-
-Simply include your custom extractor as a handler parameter:
+Any type that implements `Extract(*http.Request) error` (on a pointer
+receiver) works:
 
 ```go
-func mySecureApi(bearer BearerToken) string {
-    return "token: " + bearer.Token
+type Authed struct{ User User }
+
+func (a *Authed) Extract(r *http.Request) error {
+    u, err := userFromBearer(r.Header.Get("Authorization"))
+    if err != nil { return &m.HTTPError{Code: 401, Err: "unauthorized"} }
+    a.User = u
+    return nil
+}
+
+func me(a Authed) User { return a.User }
+```
+
+---
+
+## Returning output
+
+The most common pattern is `(T, error)`:
+
+```go
+func getUser(id m.Path[int]) (User, error) {
+    u, ok := users[id.Value]
+    if !ok {
+        return User{}, &m.HTTPError{Code: 404, Err: "not_found"}
+    }
+    return u, nil
 }
 ```
 
-### Best Practices
-
-- Keep extractors focused on single responsibility
-- Return meaningful error messages for client-side issues
-- Use `ExtractError` for consistent error handling
-- Validate and sanitize data within the extractor
-
-Custom extractors make your handlers cleaner by moving data extraction and validation logic to reusable components.
-
-## ⚙️ Configuration
-
-Mint provides flexible configuration options using the functional options pattern for clean, type-safe customization.
-
-### Basic Setup
+When you need to control the status code or headers, use `Result[T]`:
 
 ```go
-import (
-    "log"
-    "github.com/cymoo/mint"
-)
-
-func main() {
-    // Initialize configuration at application startup (recommended)
-    m.Initialize(
-        m.WithLogger(log.Default()),
-        m.WithValidation(true),
-    )
-    
-    // Your application code...
+func createUser(body m.JSON[NewUser]) m.Result[User] {
+    u := save(body.Value)
+    return m.Result[User]{
+        Code: 201,
+        Headers: http.Header{
+            "Location": {fmt.Sprintf("/users/%d", u.ID)},
+        },
+        Data: u,
+    }
 }
 ```
 
-### Available Options
+There are helpers `m.OK[T](data)` and `m.Err[T](code, err)` for trivial
+cases.
 
-#### JSON Encoding/Decoding
-
-Customize JSON marshaling and unmarshaling:
+### Special return types
 
 ```go
-import "encoding/json"
+func deleted() m.StatusCode { return 204 }
+func page() m.HTML          { return "<h1>Hi</h1>" }
+func csv() []byte           { return []byte("a,b,c\n") }
+func bigFile() io.Reader    { f, _ := os.Open("x"); return f }
+```
 
+---
+
+## Errors
+
+Mint converts errors into HTTP responses in this order of priority:
+
+1. **`*HTTPError`** — used verbatim.
+
+   ```go
+   return &m.HTTPError{Code: 404, Err: "not_found", Message: "user 42 not found"}
+   ```
+
+2. **`*ExtractError`** — emitted by built-in/custom extractors. Mint maps
+   the `Type` to a code (`body_too_large` → 413, etc.).
+
+3. **Anything else** — Mint inspects the error message to guess a status:
+   - "not found" / "doesn't exist" → 404
+   - "unauthorized" / "auth"        → 401
+   - "forbidden"                    → 403
+   - "timeout"                      → 408
+   - "conflict" / "exists"          → 409
+   - "invalid" / "validation"       → 400
+   - otherwise                      → 500
+
+### Visibility rules
+
+| Status range | `Message` in response body | Logged?           |
+|--------------|----------------------------|-------------------|
+| 4xx          | Yes — set to `err.Error()` | No                |
+| 5xx          | **Hidden** (empty)         | Yes (`mint: 5xx`) |
+
+This way internal errors don't leak to clients, but you still see them
+in logs.
+
+> If you want exact control: return `*HTTPError`. Mint will respect both
+> `Err` and `Message` regardless of code.
+
+---
+
+## Validation
+
+Validation is **on by default** and uses
+[`go-playground/validator`](https://github.com/go-playground/validator).
+The framework wires up tag-name lookup for `json`, `schema`, `header`,
+and `cookie` tags so error messages reference the **input** name, not
+the Go field name.
+
+```go
+type Body struct {
+    Email string `json:"email" validate:"required,email"`
+}
+
+// On bad input:
+// 400 {"err":"validation_failed","message":"email: required validation failed"}
+```
+
+Turn it off with `m.Configure(m.WithValidation(false))` or use a custom
+validator with `m.WithValidator(...)`.
+
+---
+
+## Streaming, SSE, hijack
+
+The `ResponseWriter` that handlers receive is a thin wrapper that still
+forwards to the underlying `http.ResponseWriter`. It explicitly
+implements:
+
+- `http.Flusher` — for SSE / `text/event-stream`
+- `http.Hijacker` — for protocol upgrades (WebSocket, etc.)
+- `http.Pusher` — for HTTP/2 push
+
+Each delegates to the underlying writer, or returns
+`http.ErrNotSupported` if the underlying server doesn't support it.
+
+```go
+func sse(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    flusher, _ := w.(http.Flusher)
+    for i := 0; i < 5; i++ {
+        fmt.Fprintf(w, "data: tick %d\n\n", i)
+        flusher.Flush()
+        time.Sleep(time.Second)
+    }
+}
+```
+
+---
+
+## Configuration
+
+Configuration is **global** and thread-safe. Set it once at startup:
+
+```go
 m.Initialize(
-    // Custom JSON marshal function
-    m.WithJSONMarshal(func(v any) ([]byte, error) {
-        return json.MarshalIndent(v, "", "  ") // Pretty print
-    }),
-    
-    // Custom JSON encode function (streaming)
-    m.WithJSONEncode(func(w io.Writer, v any) error {
-        encoder := json.NewEncoder(w)
-        encoder.SetIndent("", "  ")
-        return encoder.Encode(v)
-    }),
-    
-    // Custom JSON unmarshal function
-    m.WithJSONUnmarshal(json.Unmarshal),
+    m.WithMaxRequestBodySize(10 << 20), // 10 MiB
+    m.WithLogger(myLogger),
 )
 ```
 
-#### Schema Decoder
-
-Customize form and query parameter parsing:
-
-```go
-import "github.com/gorilla/schema"
-
-decoder := schema.NewDecoder()
-decoder.IgnoreUnknownKeys(true)
-decoder.SetAliasTag("form")
+`Initialize` should be called at most once. Use `Configure` to override
+later (e.g. in tests). `Reset` returns everything to defaults.
 
-m.Initialize(
-    m.WithSchemaDecoder(decoder),
-)
-```
-
-#### Logging
-
-Provide a custom logger:
-
-```go
-import (
-    "log"
-    "os"
-)
-
-customLogger := log.New(os.Stdout, "[MINT] ", log.LstdFlags)
-
-m.Initialize(
-    m.WithLogger(customLogger),
-)
-```
-
-#### Validation
-
-Control validation behavior:
-
-```go
-import "github.com/go-playground/validator/v10"
-
-// Disable validation
-m.Initialize(
-    m.WithValidation(false),
-)
-
-// Or use custom validator
-v := validator.New()
-v.RegisterValidation("customrule", myValidationFunc)
-
-m.Initialize(
-    m.WithValidator(v),
-)
-```
-
-#### Error Handling
-
-Customize error response format:
-
-```go
-m.Initialize(
-    m.WithErrorHandler(func(w http.ResponseWriter, err error) {
-        // Custom error logging
-        log.Printf("[ERROR] %v", err)
-        
-        // Custom error response
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(500)
-        json.NewEncoder(w).Encode(map[string]string{
-            "error": err.Error(),
-            "timestamp": time.Now().Format(time.RFC3339),
-        })
-    }),
-)
-```
-
-### Configuration Methods
-
-#### `Initialize(opts ...Option)`
-
-**One-time setup** at application startup. Uses `sync.Once` internally - safe to call multiple times but only the first call takes effect:
-
-```go
-func main() {
-    m.Initialize(
-        m.WithLogger(customLogger),
-        m.WithValidation(true),
-    )
-    
-    // Start your server...
-}
-```
-
-#### `Configure(opts ...Option)`
-
-**Runtime configuration updates**. Can be called multiple times to modify settings after initialization:
-
-```go
-// Enable debug mode at runtime
-m.Configure(
-    m.WithJSONMarshal(func(v any) ([]byte, error) {
-        return json.MarshalIndent(v, "", "  ")
-    }),
-)
-```
-
-#### `Reset()`
-
-**Reset to defaults** - useful for testing:
-
-```go
-func TestSomething(t *testing.T) {
-    defer m.Reset() // Restore defaults after test
-    
-    m.Configure(m.WithValidation(false))
-    // Test code...
-}
-```
-
-### Complete Configuration Example
-
-```go
-package main
-
-import (
-    "encoding/json"
-    "io"
-    "log"
-    "net/http"
-    "os"
-    "time"
-    
-    "github.com/cymoo/mint"
-    "github.com/go-playground/validator/v10"
-    "github.com/gorilla/schema"
-)
-
-func main() {
-    // Configure logger
-    logger := log.New(os.Stdout, "[API] ", log.LstdFlags|log.Lshortfile)
-    
-    // Configure schema decoder
-    decoder := schema.NewDecoder()
-    decoder.IgnoreUnknownKeys(true)
-    decoder.SetAliasTag("form")
-    
-    // Configure validator
-    v := validator.New()
-    v.RegisterValidation("username", func(fl validator.FieldLevel) bool {
-        return len(fl.Field().String()) >= 3
-    })
-    
-    // Initialize framework
-    m.Initialize(
-        m.WithLogger(logger),
-        m.WithSchemaDecoder(decoder),
-        m.WithValidator(v),
-        m.WithJSONMarshal(func(v any) ([]byte, error) {
-            return json.MarshalIndent(v, "", "  ")
-        }),
-        m.WithErrorHandler(func(w http.ResponseWriter, err error) {
-            logger.Printf("Error occurred: %v", err)
-            
-            response := map[string]any{
-                "success": false,
-                "error":   err.Error(),
-                "time":    time.Now().Unix(),
-            }
-            
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(http.StatusInternalServerError)
-            json.NewEncoder(w).Encode(response)
-        }),
-    )
-    
-    // Setup routes
-    mux := http.NewServeMux()
-    // ... your routes
-    
-    logger.Println("Server starting on :8080")
-    log.Fatal(http.ListenAndServe(":8080", mux))
-}
-```
-
-### Thread Safety
-
-All configuration methods are thread-safe:
-- `Initialize()` uses `sync.Once` for one-time setup
-- `Configure()` and `Reset()` use mutex locks for safe concurrent access
-- Config reads use `RWMutex` for efficient concurrent access
-
-### Default Configuration
-
-If you don't call `Initialize()` or `Configure()`, Mint uses sensible defaults:
-
-```go
-// Default config (automatically applied)
-{
-    SchemaDecoder:     schema.NewDecoder() with IgnoreUnknownKeys(true),
-    EnableValidation:  true,
-    Validator:         validator with JSON/schema/form tag support,
-    Logger:            log.Default(),
-    JSONMarshalFunc:   json.Marshal,
-    JSONUnmarshalFunc: json.Unmarshal,
-}
-```
-
-## 🎯 Complete Example
-
-```go
-package main
-
-import (
-    "log"
-    "net/http"
-    "github.com/cymoo/mint"
-)
-
-type User struct {
-    ID    int    `json:"id"`
-    Name  string `json:"name"`
-    Email string `json:"email"`
-}
-
-type CreateUserRequest struct {
-    Name  string `json:"name"`
-    Email string `json:"email"`
-}
-
-var users = map[int]User{
-    1: {ID: 1, Name: "Alice", Email: "alice@example.com"},
-}
-
-func main() {
-    mux := http.NewServeMux()
-    
-    // List users
-    mux.HandleFunc("GET /api/users", m.H(func() []User {
-        result := make([]User, 0, len(users))
-        for _, u := range users {
-            result = append(result, u)
-        }
-        return result
-    }))
-    
-    // Get user by ID
-    mux.HandleFunc("GET /api/users/{id}", m.H(func(id m.Path[int]) (User, error) {
-        user, ok := users[id.Value]
-        if !ok {
-            return User{}, &m.HTTPError{Code: 404, Err: "not_found"}
-        }
-        return user, nil
-    }))
-    
-    // Create user
-    mux.HandleFunc("POST /api/users", m.H(func(body m.JSON[CreateUserRequest]) m.Result[User] {
-        user := User{
-            ID:    len(users) + 1,
-            Name:  body.Value.Name,
-            Email: body.Value.Email,
-        }
-        users[user.ID] = user
-        
-        return m.Result[User]{
-            Code: 201,
-            Data: user,
-        }
-    }))
-    
-    // Delete user
-    mux.HandleFunc("DELETE /api/users/{id}", m.H(func(id m.Path[int]) (m.StatusCode, error) {
-        if _, ok := users[id.Value]; !ok {
-            return 0, &m.HTTPError{Code: 404, Err: "not_found"}
-        }
-        delete(users, id.Value)
-        return m.StatusCode(204), nil
-    }))
-    
-    log.Println("Server running on :8080")
-    log.Fatal(http.ListenAndServe(":8080", mux))
-}
-```
-
-## 🔍 Error Response Format
-
-Errors are automatically serialized to JSON:
-
-```json
-{
-  "code": 404,
-  "error": "not_found",
-  "message": "user not found"
-}
-```
-
-### Built-in Error Types
-
-The framework handles common errors automatically:
-
-- `json.UnmarshalTypeError` → 400 with field details
-- `json.SyntaxError` → 400 invalid JSON
-- `schema.MultiError` → 400 with validation messages
-- Generic errors → Status inferred from message (e.g., "not found" → 404)
-
-## 🎨 Best Practices
-
-### 1. Use Descriptive Error Messages
-
-```go
-return &m.HTTPError{
-    Code:    400,
-    Err:     "validation_error",
-    Message: "email must contain @ symbol",
-}
-```
-
-### 2. Leverage Type Safety
-
-```go
-// Good: Type-safe path parameter
-func getUser(id m.Path[int]) (User, error)
-
-// Avoid: Manual parsing
-func getUser(r *http.Request) (User, error) {
-    idStr := r.PathValue("id")
-    id, _ := strconv.Atoi(idStr) // Error-prone
-}
-```
-
-### 3. Return Structs for JSON
-
-```go
-// Good: Automatic JSON serialization
-func listUsers() []User
-
-// Verbose: Manual serialization
-func listUsers(w http.ResponseWriter, r *http.Request) {
-    json.NewEncoder(w).Encode(users)
-}
-```
-
-### 4. Combine Extractors
-
-```go
-// Multiple parameters work seamlessly
-func updateUser(
-    id m.Path[int],
-    body m.JSON[UpdateUserRequest],
-    q m.Query[Options],
-) (User, error) {
-    // Handler implementation
-}
-```
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) file for details
+| Option                         | Default                                 |
+|--------------------------------|------------------------------------------|
+| `WithMaxRequestBodySize(n)`    | `5 << 20` (5 MiB). Pass `0` to disable. |
+| `WithJSONEncode(fn)`           | `json.Encoder` with `SetEscapeHTML(false)` |
+| `WithJSONMarshal(fn)`          | _(unset; falls back to encoder)_         |
+| `WithJSONUnmarshal(fn)`        | `json.Unmarshal`                         |
+| `WithSchemaDecoder(d)`         | `schema.Decoder` with `IgnoreUnknownKeys(true)` |
+| `WithValidation(bool)`         | `true`                                   |
+| `WithValidator(v)`             | auto-created when validation enabled     |
+| `WithLogger(l)`                | `log.Default()`                          |
+| `WithErrorHandler(fn)`         | built-in (returns JSON `HTTPError`)      |
+
+---
+
+## Pitfalls & limitations
+
+A short, honest list of things that will bite you if you don't know
+them.
+
+**1. `Path[T]` binds positionally, not by name.**
+See the [`Path[T]`](#patht) section. The order of `Path[T]` parameters
+in your function must match the left-to-right order of `{name}` in the
+URL pattern. The Go variable names are ignored.
+
+**2. Request body is capped at 5 MiB by default.**
+JSON and form bodies above the limit get 413
+`{"err":"body_too_large"}`. Configure with
+`m.WithMaxRequestBodySize(n)`. Set to `0` to disable (not recommended).
+
+**3. 5xx error messages are hidden from clients by default.**
+Generic errors with a 5xx-mapped status produce a body without
+`Message`. The full error is logged. Return an `*HTTPError` if you
+intentionally want the message in the response.
+
+**4. JSON output does not escape `<`, `>`, `&` by default.**
+Mint's default encoder calls `json.Encoder.SetEscapeHTML(false)`. If you
+embed user-controlled JSON inside an HTML page, escape it yourself.
+Restore the standard behavior with `m.WithJSONMarshal(json.Marshal)`.
+
+**5. Configuration is global.**
+Calling `Configure` from multiple goroutines is safe, but it affects
+every request. Don't tweak it per-request.
+
+**6. `Initialize` should be called once.**
+A second call is ignored — Mint will log a warning telling you so. Use
+`Configure` to layer further changes, or `Reset` (in tests).
+
+**7. `ResponseWriter` is wrapped.**
+Type-asserting to your own custom interface won't work. Use
+`http.NewResponseController(w)` or the explicit methods Mint exposes
+(`Flush`, `Hijack`, `Push`). Call `Unwrap()` if you need the raw writer.
+
+**8. Handler signatures are checked at registration, not compile time.**
+A bad signature passed to `m.H` panics when `H` runs. Register all
+routes at startup so problems surface immediately.
+
+---
+
+## What Mint does not do
+
+By design:
+
+- **No router.** Use `http.ServeMux` (Go 1.22+ patterns) or anything
+  else that produces `http.HandlerFunc`.
+- **No middleware system.** Use `func(http.Handler) http.Handler`
+  middleware — Mint's adapter is itself just an `http.HandlerFunc`.
+- **No request context wrapper.** Use `r.Context()`.
+- **No DI container, no app object, no global state beyond config.**
+
+If you want any of these, pick a heavier framework. If you want plain
+Go with less boilerplate, Mint is for you.
+
+---
+
+## License
+
+MIT — see `LICENSE`.

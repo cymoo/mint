@@ -1,262 +1,399 @@
+// Package main is a runnable tour of every Mint feature.
+//
+// Run it with:
+//
+//	go run ./_examples
+//
+// Then poke at it with curl. Each handler below has a comment showing
+// the example request and expected response.
 package main
 
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	m "github.com/cymoo/mint"
 )
 
-// Domain models
+// ============================================================================
+// Domain types
+// ============================================================================
+
 type User struct {
 	ID    int    `json:"id"`
 	Name  string `json:"name"`
 	Email string `json:"email"`
 }
 
-type CreateUserRequest struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
+type CreateUserBody struct {
+	Name  string `json:"name"  validate:"required,min=2,max=50"`
+	Email string `json:"email" validate:"required,email"`
 }
 
-type UpdateUserRequest struct {
-	Name  string `json:"name,omitempty"`
-	Email string `json:"email,omitempty"`
+type UpdateUserBody struct {
+	Name  string `json:"name,omitempty"  validate:"omitempty,min=2,max=50"`
+	Email string `json:"email,omitempty" validate:"omitempty,email"`
 }
 
-type UserQueryParams struct {
-	Page  int    `schema:"page"`
+type ListUsersQuery struct {
+	Page  int    `schema:"page"  validate:"gte=0"`
 	Limit int    `schema:"limit" validate:"gte=0,lte=100"`
-	Sort  string `schema:"sort"`
+	Sort  string `schema:"sort"  validate:"omitempty,oneof=name email id"`
 }
 
 type LoginForm struct {
-	Username string `schema:"username"`
-	Password string `schema:"password"`
+	Username string `schema:"username" validate:"required"`
+	Password string `schema:"password" validate:"required,min=8"`
 }
 
-// Simple in-memory storage
+type AuthHeaders struct {
+	Token     string `header:"Authorization" validate:"required"`
+	RequestID string `header:"X-Request-ID"`
+}
+
+type SessionCookies struct {
+	SessionID string `cookie:"session_id" validate:"required"`
+	Theme     string `cookie:"theme"`
+}
+
+// ============================================================================
+// In-memory store
+// ============================================================================
+
 var (
-	users = map[int]User{
+	storeMu sync.RWMutex
+	users   = map[int]User{
 		1: {ID: 1, Name: "Alice", Email: "alice@example.com"},
 		2: {ID: 2, Name: "Bob", Email: "bob@example.com"},
 	}
-	nextID = 3
+	nextID atomic.Int32
 )
 
+func init() { nextID.Store(3) }
+
+// ============================================================================
+// Wiring
+// ============================================================================
+
 func main() {
+	m.Initialize(
+		m.WithMaxRequestBodySize(1 << 20), // 1 MiB — tighter than default
+	)
+
 	mux := http.NewServeMux()
 
-	// Basic responses
-	mux.HandleFunc("GET /", m.H(handleHome))
-	mux.HandleFunc("GET /html", m.H(handleHTML))
+	// Plain responses
+	mux.HandleFunc("GET /", m.H(home))
+	mux.HandleFunc("GET /html", m.H(htmlPage))
 
-	// RESTful API with automatic parameter extraction
-	mux.HandleFunc("GET /api/users", m.H(handleListUsers))
-	mux.HandleFunc("GET /api/users/{id}", m.H(handleGetUser))
-	mux.HandleFunc("POST /api/users", m.H(handleCreateUser))
-	mux.HandleFunc("PUT /api/users/{id}", m.H(handleUpdateUser))
-	mux.HandleFunc("DELETE /api/users/{id}", m.H(handleDeleteUser))
+	// CRUD with JSON bodies and validation
+	mux.HandleFunc("GET    /users", m.H(listUsers))
+	mux.HandleFunc("GET    /users/{id}", m.H(getUser))
+	mux.HandleFunc("POST   /users", m.H(createUser))
+	mux.HandleFunc("PUT    /users/{id}", m.H(updateUser))
+	mux.HandleFunc("DELETE /users/{id}", m.H(deleteUser))
 
-	// Different parameter extraction types
-	mux.HandleFunc("GET /api/search", m.H(handleSearch))     // Query params
-	mux.HandleFunc("POST /api/login", m.H(handleLogin))      // Form data
-	mux.HandleFunc("GET /api/calc/{a}/{b}", m.H(handleCalc)) // Multiple path params
+	// Query, Form, multi-Path
+	mux.HandleFunc("GET  /search", m.H(search))
+	mux.HandleFunc("POST /login", m.H(login))
+	mux.HandleFunc("GET  /calc/{a}/{b}", m.H(calc))
 
-	// Advanced response handling
-	mux.HandleFunc("GET /api/custom", m.H(handleCustomResult)) // Result with headers
-	mux.HandleFunc("GET /api/status", m.H(handleStatusOnly))   // StatusCode only
-	mux.HandleFunc("GET /api/binary", m.H(handleBinary))       // Binary response
+	// Header & Cookie extractors
+	mux.HandleFunc("GET /me", m.H(me))            // Authorization header
+	mux.HandleFunc("GET /session", m.H(session))  // session_id cookie
 
-	// Error handling patterns
-	mux.HandleFunc("GET /api/error", m.H(handleError))            // Generic error
-	mux.HandleFunc("GET /api/http-error", m.H(handleHTTPError))   // Custom HTTP error
-	mux.HandleFunc("GET /api/users/{id}/check", m.H(handleCheck)) // (data, error) pattern
+	// Custom Result, status-only, binary, HTML
+	mux.HandleFunc("GET /custom", m.H(customResult))
+	mux.HandleFunc("GET /status", m.H(statusOnly))
+	mux.HandleFunc("GET /csv", m.H(csv))
+	mux.HandleFunc("GET /download/{name}", m.H(download))
 
-	// Direct access to http primitives
-	mux.HandleFunc("GET /api/raw", m.H(handleRaw))
+	// Error patterns
+	mux.HandleFunc("GET /err/generic", m.H(genericErr))
+	mux.HandleFunc("GET /err/4xx", m.H(http4xx))
+	mux.HandleFunc("GET /err/5xx", m.H(http5xx))
+	mux.HandleFunc("GET /err/teapot", m.H(teapot))
 
-	log.Println("🚀 Server running at http://localhost:8080")
+	// SSE — uses http.Flusher through the wrapped ResponseWriter
+	mux.HandleFunc("GET /sse", m.H(sse))
+
+	// Raw http.ResponseWriter + *http.Request
+	mux.HandleFunc("GET /raw", m.H(raw))
+
+	log.Println("🌿 Mint demo on http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
 
 // ============================================================================
-// Handler Functions - Demonstrating framework features
+// Handlers
 // ============================================================================
 
-// 1. Simple string response
-func handleHome() string {
-	return "Welcome to the API! 🎉"
+// home: simplest possible handler — return a string.
+//
+//   curl http://localhost:8080/
+//   "Welcome to Mint!"
+func home() string {
+	return "Welcome to Mint!"
 }
 
-// 2. HTML response
-func handleHTML() m.HTML {
-	return m.HTML("<h1>Hello World</h1><p>This is HTML content</p>")
+// htmlPage: m.HTML sets Content-Type: text/html.
+//
+//   curl http://localhost:8080/html
+func htmlPage() m.HTML {
+	return `<h1>Hello</h1><p>This is an HTML response.</p>`
 }
 
-// 3. Return struct (auto JSON serialization)
-func handleListUsers(q m.Query[UserQueryParams]) []User {
-	log.Printf("Query: page=%d, limit=%d, sort=%s", q.Value.Page, q.Value.Limit, q.Value.Sort)
-
-	result := make([]User, 0, len(users))
+// listUsers: query parameters with validation.
+//
+//   curl 'http://localhost:8080/users?page=1&limit=20&sort=name'
+func listUsers(q m.Query[ListUsersQuery]) []User {
+	storeMu.RLock()
+	defer storeMu.RUnlock()
+	out := make([]User, 0, len(users))
 	for _, u := range users {
-		result = append(result, u)
+		out = append(out, u)
 	}
-	return result
+	return out
 }
 
-// 4. Path parameter extraction + error handling
-func handleGetUser(id m.Path[int]) (*User, error) {
-	user, ok := users[id.Value]
+// getUser: a single typed path parameter + (T, error) return.
+//
+//   curl http://localhost:8080/users/1
+//   curl http://localhost:8080/users/999  # 404
+func getUser(id m.Path[int]) (User, error) {
+	storeMu.RLock()
+	defer storeMu.RUnlock()
+	u, ok := users[id.Value]
 	if !ok {
-		return nil, &m.HTTPError{
+		return User{}, &m.HTTPError{
 			Code:    404,
 			Err:     "not_found",
 			Message: fmt.Sprintf("user %d not found", id.Value),
 		}
 	}
-	return &user, nil
+	return u, nil
 }
 
-// 5. JSON body extraction + Result with custom status and headers
-func handleCreateUser(body m.JSON[CreateUserRequest]) m.Result[User] {
-	user := User{
-		ID:    nextID,
-		Name:  body.Value.Name,
-		Email: body.Value.Email,
-	}
-	users[nextID] = user
-	nextID++
-
+// createUser: JSON body extraction + validation + Result with custom status/headers.
+//
+//   curl -X POST http://localhost:8080/users \
+//        -H 'Content-Type: application/json' \
+//        -d '{"name":"Eve","email":"eve@example.com"}'
+func createUser(body m.JSON[CreateUserBody]) m.Result[User] {
+	storeMu.Lock()
+	defer storeMu.Unlock()
+	u := User{ID: int(nextID.Add(1)) - 1, Name: body.Value.Name, Email: body.Value.Email}
+	users[u.ID] = u
 	return m.Result[User]{
-		Code: 201, // Custom status code
+		Code: 201,
 		Headers: http.Header{
-			"Location": []string{fmt.Sprintf("/api/users/%d", user.ID)},
+			"Location": {fmt.Sprintf("/users/%d", u.ID)},
 		},
-		Data: user,
+		Data: u,
 	}
 }
 
-// 6. Path param + JSON body (two-value return pattern)
-func handleUpdateUser(id m.Path[int], body m.JSON[UpdateUserRequest]) (User, error) {
-	user, ok := users[id.Value]
+// updateUser: Path[T] + JSON[T] together.
+//
+//   curl -X PUT http://localhost:8080/users/1 \
+//        -H 'Content-Type: application/json' \
+//        -d '{"name":"Alice Jr."}'
+func updateUser(id m.Path[int], body m.JSON[UpdateUserBody]) (User, error) {
+	storeMu.Lock()
+	defer storeMu.Unlock()
+	u, ok := users[id.Value]
 	if !ok {
 		return User{}, &m.HTTPError{Code: 404, Err: "not_found"}
 	}
-
 	if body.Value.Name != "" {
-		user.Name = body.Value.Name
+		u.Name = body.Value.Name
 	}
 	if body.Value.Email != "" {
-		user.Email = body.Value.Email
+		u.Email = body.Value.Email
 	}
-	users[id.Value] = user
-
-	return user, nil
+	users[id.Value] = u
+	return u, nil
 }
 
-// 7. Return StatusCode only (useful for 204 No Content)
-func handleDeleteUser(id m.Path[int]) (m.StatusCode, error) {
+// deleteUser: status-only return.
+//
+//   curl -X DELETE http://localhost:8080/users/1 -i
+func deleteUser(id m.Path[int]) (m.StatusCode, error) {
+	storeMu.Lock()
+	defer storeMu.Unlock()
 	if _, ok := users[id.Value]; !ok {
 		return 0, &m.HTTPError{Code: 404, Err: "not_found"}
 	}
 	delete(users, id.Value)
-	return m.StatusCode(204), nil
+	return 204, nil
 }
 
-// 8. Query parameter extraction
-func handleSearch(q m.Query[UserQueryParams]) map[string]any {
+// search: read-only query handler.
+//
+//   curl 'http://localhost:8080/search?q=alice&page=1&limit=10'
+func search(q m.Query[struct {
+	Q     string `schema:"q"`
+	Page  int    `schema:"page"  validate:"gte=0"`
+	Limit int    `schema:"limit" validate:"gte=0,lte=100"`
+}]) map[string]any {
 	return map[string]any{
+		"q":     q.Value.Q,
 		"page":  q.Value.Page,
 		"limit": q.Value.Limit,
-		"sort":  q.Value.Sort,
-		"info":  "Query parameters extracted automatically",
 	}
 }
 
-// 9. Form data extraction
-func handleLogin(form m.Form[LoginForm]) map[string]string {
+// login: form data extraction.
+//
+//   curl -X POST http://localhost:8080/login \
+//        -d 'username=alice&password=hunter22'
+func login(f m.Form[LoginForm]) map[string]string {
 	return map[string]string{
-		"status":   "success",
-		"username": form.Value.Username,
-		"token":    "demo-token-12345",
+		"status":   "ok",
+		"username": f.Value.Username,
+		"token":    "demo-token",
 	}
 }
 
-// 10. Multiple path parameters with different types
-func handleCalc(a m.Path[int], b m.Path[float64]) map[string]any {
+// calc: multiple path parameters with different types.
+//
+// ⚠️ Positional binding: the first Path[T] gets {a}, the second gets {b}.
+//
+//   curl http://localhost:8080/calc/3/4.5
+func calc(a m.Path[int], b m.Path[float64]) map[string]any {
 	return map[string]any{
-		"a":       a.Value,
-		"b":       b.Value,
 		"sum":     float64(a.Value) + b.Value,
 		"product": float64(a.Value) * b.Value,
 	}
 }
 
-// 11. Result type with custom headers
-func handleCustomResult() m.Result[map[string]any] {
+// me: Header[T] extraction for an Authorization header.
+//
+//   curl http://localhost:8080/me -H 'Authorization: Bearer xyz' -H 'X-Request-ID: r1'
+func me(h m.Header[AuthHeaders]) map[string]string {
+	return map[string]string{
+		"token":      h.Value.Token,
+		"request_id": h.Value.RequestID,
+	}
+}
+
+// session: Cookie[T] extraction.
+//
+//   curl http://localhost:8080/session --cookie 'session_id=abc; theme=dark'
+func session(c m.Cookie[SessionCookies]) map[string]string {
+	return map[string]string{
+		"session_id": c.Value.SessionID,
+		"theme":      c.Value.Theme,
+	}
+}
+
+// customResult: Result with custom headers.
+//
+//   curl -i http://localhost:8080/custom
+func customResult() m.Result[map[string]any] {
 	return m.Result[map[string]any]{
 		Code: 200,
 		Headers: http.Header{
-			"X-Custom-Header": []string{"custom-value"},
-			"X-Timestamp":     []string{time.Now().Format(time.RFC3339)},
+			"X-Custom": {"hi"},
+			"X-Time":   {time.Now().UTC().Format(time.RFC3339)},
 		},
-		Data: map[string]any{
-			"message": "Response with custom headers",
-			"time":    time.Now(),
-		},
+		Data: map[string]any{"ok": true},
 	}
 }
 
-// 12. Return only status code
-func handleStatusOnly() m.StatusCode {
-	return m.StatusCode(202) // 202 Accepted
-}
+// statusOnly: bare m.StatusCode.
+//
+//   curl -i http://localhost:8080/status
+func statusOnly() m.StatusCode { return 202 }
 
-// 13. Binary response ([]byte)
-func handleBinary() []byte {
-	csv := "ID,Name,Email\n"
+// csv: []byte body. Use Content-Type via raw access for non-octet types.
+//
+//   curl http://localhost:8080/csv
+func csv() []byte {
+	var b strings.Builder
+	b.WriteString("id,name,email\n")
+	storeMu.RLock()
+	defer storeMu.RUnlock()
 	for _, u := range users {
-		csv += fmt.Sprintf("%d,%s,%s\n", u.ID, u.Name, u.Email)
+		fmt.Fprintf(&b, "%d,%s,%s\n", u.ID, u.Name, u.Email)
 	}
-	return []byte(csv)
+	return []byte(b.String())
 }
 
-// 14. Generic error (framework infers status code from message)
-func handleError() error {
-	return errors.New("something went wrong")
+// download: stream from an io.Reader.
+//
+//   curl http://localhost:8080/download/hello.txt
+func download(name m.Path[string]) io.Reader {
+	return strings.NewReader("contents of " + name.Value + "\n")
 }
 
-// 15. Custom HTTP error with specific code
-func handleHTTPError() error {
-	return &m.HTTPError{
-		Code:    418,
-		Err:     "teapot",
-		Message: "I'm a teapot",
-	}
+// genericErr: a plain error → Mint guesses status from the message.
+//
+//   curl -i http://localhost:8080/err/generic
+//   # 500, message hidden, original logged
+func genericErr() error {
+	return errors.New("something internal failed")
 }
 
-// 16. Two-value return: (data, error) pattern
-func handleCheck(id m.Path[int]) (map[string]any, error) {
-	user, ok := users[id.Value]
+// http4xx: 4xx errors keep their message in the response.
+//
+//   curl -i http://localhost:8080/err/4xx
+func http4xx() error {
+	return errors.New("invalid request: missing field x")
+}
+
+// http5xx: explicit *HTTPError lets you override the default visibility.
+//
+//   curl -i http://localhost:8080/err/5xx
+func http5xx() error {
+	return &m.HTTPError{Code: 503, Err: "unavailable", Message: "DB is down"}
+}
+
+// teapot: any custom code via *HTTPError.
+//
+//   curl -i http://localhost:8080/err/teapot
+func teapot() error {
+	return &m.HTTPError{Code: 418, Err: "teapot", Message: "I'm a teapot"}
+}
+
+// sse: Server-Sent Events using the wrapped ResponseWriter's Flusher.
+//
+//   curl -N http://localhost:8080/sse
+func sse(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
 	if !ok {
-		return nil, &m.HTTPError{Code: 404, Err: "not_found"}
+		http.Error(w, "streaming unsupported", 500)
+		return
 	}
 
-	return map[string]any{
-		"user_id":    user.ID,
-		"valid":      true,
-		"checked_at": time.Now(),
-	}, nil
+	for i := 0; i < 5; i++ {
+		select {
+		case <-r.Context().Done():
+			return
+		default:
+		}
+		fmt.Fprintf(w, "data: tick %d\n\n", i)
+		flusher.Flush()
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
-// 17. Direct access to http.ResponseWriter and *http.Request
-func handleRaw(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("X-Custom", "direct-access")
-	fmt.Fprintf(w, "Direct access to ResponseWriter and Request\n")
-	fmt.Fprintf(w, "Method: %s\n", r.Method)
-	fmt.Fprintf(w, "URL: %s\n", r.URL)
+// raw: full access to ResponseWriter and Request — no Mint magic.
+//
+//   curl -i http://localhost:8080/raw
+func raw(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Raw", "yes")
+	fmt.Fprintln(w, "Method:", r.Method)
+	fmt.Fprintln(w, "URL:   ", r.URL)
 }
