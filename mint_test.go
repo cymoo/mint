@@ -8,9 +8,13 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -50,6 +54,40 @@ func parseJSONResponse(t *testing.T, body []byte, v any) {
 	if err := json.Unmarshal(body, v); err != nil {
 		t.Fatalf("Failed to parse JSON response: %v", err)
 	}
+}
+
+type testMultipartFile struct {
+	field    string
+	filename string
+	content  string
+}
+
+func createMultipartRequest(t *testing.T, fields map[string]string, files []testMultipartFile) *http.Request {
+	t.Helper()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for name, value := range fields {
+		if err := writer.WriteField(name, value); err != nil {
+			t.Fatalf("WriteField: %v", err)
+		}
+	}
+	for _, file := range files {
+		part, err := writer.CreateFormFile(file.field, file.filename)
+		if err != nil {
+			t.Fatalf("CreateFormFile: %v", err)
+		}
+		if _, err := io.WriteString(part, file.content); err != nil {
+			t.Fatalf("write multipart file: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	return req
 }
 
 // ========== JSON Extractor Tests ==========
@@ -189,6 +227,178 @@ func TestFormExtractor(t *testing.T) {
 			t.Fatalf("Extract failed: %v", err)
 		}
 	})
+
+	t.Run("multipart form data", func(t *testing.T) {
+		req := createMultipartRequest(t, map[string]string{
+			"username": "jane",
+			"password": "secret456",
+		}, nil)
+
+		var f Form[FormData]
+		err := f.Extract(req)
+		if err != nil {
+			t.Fatalf("Extract failed: %v", err)
+		}
+		if f.Value.Username != "jane" {
+			t.Errorf("expected Username=jane, got %s", f.Value.Username)
+		}
+		if f.Value.Password != "secret456" {
+			t.Errorf("expected Password=secret456, got %s", f.Value.Password)
+		}
+	})
+
+	t.Run("multipart file parts", func(t *testing.T) {
+		type UploadForm struct {
+			Title     string      `schema:"title"`
+			Upload    FilePart    `schema:"upload"`
+			UploadPtr *FilePart   `schema:"upload"`
+			Extras    []FilePart  `schema:"extra"`
+			ExtraPtrs []*FilePart `schema:"extra"`
+			ByFormTag *FilePart   `form:"form_file"`
+		}
+
+		req := createMultipartRequest(t, map[string]string{
+			"title": "profile",
+		}, []testMultipartFile{
+			{field: "upload", filename: "avatar.txt", content: "hello"},
+			{field: "extra", filename: "a.txt", content: "A"},
+			{field: "extra", filename: "b.txt", content: "BB"},
+			{field: "form_file", filename: "form.txt", content: "form"},
+		})
+
+		var f Form[UploadForm]
+		err := f.Extract(req)
+		if err != nil {
+			t.Fatalf("Extract failed: %v", err)
+		}
+		if f.Value.Title != "profile" {
+			t.Errorf("expected Title=profile, got %s", f.Value.Title)
+		}
+		if f.Value.Upload.Name != "upload" {
+			t.Errorf("expected file field upload, got %s", f.Value.Upload.Name)
+		}
+		if f.Value.Upload.Filename != "avatar.txt" {
+			t.Errorf("expected filename avatar.txt, got %s", f.Value.Upload.Filename)
+		}
+		if f.Value.Upload.Size != int64(len("hello")) {
+			t.Errorf("expected size %d, got %d", len("hello"), f.Value.Upload.Size)
+		}
+		if f.Value.UploadPtr == nil || f.Value.UploadPtr.Filename != "avatar.txt" {
+			t.Errorf("expected pointer file avatar.txt, got %#v", f.Value.UploadPtr)
+		}
+		if len(f.Value.Extras) != 2 {
+			t.Fatalf("expected 2 extra files, got %d", len(f.Value.Extras))
+		}
+		if f.Value.Extras[1].Filename != "b.txt" {
+			t.Errorf("expected second extra filename b.txt, got %s", f.Value.Extras[1].Filename)
+		}
+		if len(f.Value.ExtraPtrs) != 2 || f.Value.ExtraPtrs[1].Filename != "b.txt" {
+			t.Errorf("expected pointer extra files to bind, got %#v", f.Value.ExtraPtrs)
+		}
+		if f.Value.ByFormTag == nil || f.Value.ByFormTag.Filename != "form.txt" {
+			t.Errorf("expected form tag file binding, got %#v", f.Value.ByFormTag)
+		}
+
+		target := filepath.Join(t.TempDir(), "nested", "avatar.txt")
+		if err := f.Value.Upload.Save(target); err != nil {
+			t.Fatalf("Save failed: %v", err)
+		}
+		saved, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if string(saved) != "hello" {
+			t.Errorf("expected saved content hello, got %q", string(saved))
+		}
+		if !f.Value.Upload.Consumed() {
+			t.Error("expected file part to be consumed after Save")
+		}
+		if err := f.Value.Upload.Save(filepath.Join(t.TempDir(), "again.txt")); err == nil {
+			t.Fatal("expected second Save to fail")
+		}
+	})
+}
+
+func TestFileExtractor(t *testing.T) {
+	handler := H(func(file File) string {
+		return fmt.Sprintf("%s:%s:%d", file.Value.Name, file.Value.Filename, file.Value.Size)
+	})
+
+	req := createMultipartRequest(t, nil, []testMultipartFile{
+		{field: "upload", filename: "avatar.txt", content: "hello"},
+	})
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+	if rec.Body.String() != "upload:avatar.txt:5" {
+		t.Errorf("unexpected body: %s", rec.Body.String())
+	}
+}
+
+func TestMultipartFileBindingIgnoresNilHeaders(t *testing.T) {
+	header := &multipart.FileHeader{
+		Filename: "ok.txt",
+		Header:   make(textproto.MIMEHeader),
+		Size:     2,
+	}
+	header.Header.Set("Content-Type", "text/plain")
+
+	type UploadForm struct {
+		File  FilePart    `schema:"file"`
+		Files []FilePart  `schema:"files"`
+		Ptrs  []*FilePart `schema:"ptrs"`
+	}
+
+	target := &UploadForm{}
+	err := bindMultipartFiles(target, &multipart.Form{
+		File: map[string][]*multipart.FileHeader{
+			"file":  {nil, header},
+			"files": {header, nil},
+			"ptrs":  {nil, header},
+		},
+	})
+	if err != nil {
+		t.Fatalf("bindMultipartFiles: %v", err)
+	}
+	if target.File.Filename != "ok.txt" {
+		t.Errorf("expected file binding to skip nil and use ok.txt, got %q", target.File.Filename)
+	}
+	if len(target.Files) != 1 || target.Files[0].Filename != "ok.txt" {
+		t.Errorf("expected one non-nil file, got %#v", target.Files)
+	}
+	if len(target.Ptrs) != 1 || target.Ptrs[0] == nil || target.Ptrs[0].Filename != "ok.txt" {
+		t.Errorf("expected one non-nil pointer file, got %#v", target.Ptrs)
+	}
+
+	part, ok := firstFilePart(&multipart.Form{
+		File: map[string][]*multipart.FileHeader{
+			"upload": {nil, header},
+		},
+	})
+	if !ok || part.Filename != "ok.txt" {
+		t.Errorf("expected firstFilePart to skip nil headers, got ok=%v part=%#v", ok, part)
+	}
+}
+
+func TestFileExtractorMissingFile(t *testing.T) {
+	handler := H(func(file File) string { return file.Value.Filename })
+
+	req := createMultipartRequest(t, map[string]string{"title": "no file"}, nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", rec.Code)
+	}
+
+	var resp HTTPError
+	parseJSONResponse(t, rec.Body.Bytes(), &resp)
+	if resp.Err != "missing_file" {
+		t.Errorf("expected missing_file, got %s", resp.Err)
+	}
 }
 
 // ========== Path Extractor Tests ==========

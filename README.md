@@ -32,6 +32,7 @@ Requires **Go 1.23+** (for the enhanced routing patterns in `net/http`).
   - [`JSON[T]`](#jsont)
   - [`Query[T]`](#queryt)
   - [`Form[T]`](#formt)
+  - [`File`](#file)
   - [`Path[T]`](#patht)
   - [`Header[T]`](#headert)
   - [`Cookie[T]`](#cookiet)
@@ -93,7 +94,8 @@ http.HandleFunc(pattern, m.H(yourFunc))
 |---------------------------|------------------------------------------------|
 | `m.JSON[T]`               | Decoded + validated JSON body                  |
 | `m.Query[T]`              | Decoded + validated query string               |
-| `m.Form[T]`               | Decoded + validated form (`application/x-www-form-urlencoded`) |
+| `m.Form[T]`               | Decoded + validated form (`application/x-www-form-urlencoded` or `multipart/form-data`) |
+| `m.File`                  | First uploaded file from a multipart form       |
 | `m.Path[T]`               | A single typed path parameter                  |
 | `m.Header[T]`             | Headers mapped onto a struct via `header` tags |
 | `m.Cookie[T]`             | Cookies mapped onto a struct via `cookie` tags |
@@ -173,7 +175,40 @@ type Login struct {
 func login(f m.Form[Login]) error { ... }
 ```
 
-Same conventions as `Query[T]`, but reads `r.Form` after `ParseForm`.
+Same conventions as `Query[T]`, but reads `r.Form` after parsing URL-encoded
+or multipart form data.
+
+Multipart file fields can be bound by `schema`/`form` tag to `m.FilePart`,
+`*m.FilePart`, `[]m.FilePart`, or `[]*m.FilePart`:
+
+```go
+type Upload struct {
+    Title string     `schema:"title"`
+    File  m.FilePart `schema:"file"`
+}
+
+func upload(f m.Form[Upload]) error {
+    name := filepath.Base(f.Value.File.Filename)
+    return f.Value.File.Save(filepath.Join("./uploads", name))
+}
+```
+
+`FilePart.Save(path)` streams the upload to disk, creates parent directories,
+removes a partial target on failure, and can only be called once. Use
+`FilePart.Open()` if you need to stream the file yourself.
+
+### `File`
+
+```go
+func upload(file m.File) error {
+    name := filepath.Base(file.Value.Filename)
+    return file.Save(filepath.Join("./uploads", name))
+}
+```
+
+`File` extracts the first uploaded file from a `multipart/form-data` request.
+Use `Form[T]` with `FilePart` fields when you need to bind a specific form
+field name or accept multiple files.
 
 ### `Path[T]`
 

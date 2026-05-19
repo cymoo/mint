@@ -16,12 +16,18 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/gorilla/schema"
@@ -36,12 +42,18 @@ import (
 // WithMaxRequestBodySize. Set to <= 0 to disable.
 const DefaultMaxRequestBodySize int64 = 5 << 20
 
+// DefaultMultipartMemory is the in-memory budget passed to
+// Request.ParseMultipartForm. File content beyond this threshold is stored in
+// temporary files by the standard library.
+const DefaultMultipartMemory int64 = 32 << 20
+
 // ExtractError type names (used by toHTTPError to decide the HTTP status).
 const (
 	ErrTypeBodyRead       = "body_read_error"
 	ErrTypeBodyTooLarge   = "body_too_large"
 	ErrTypeEmptyBody      = "empty_body"
 	ErrTypeFormParse      = "form_parse_error"
+	ErrTypeFileMissing    = "file_missing"
 	ErrTypePathConversion = "path_conversion_error"
 	ErrTypeMissingPath    = "missing_path_value"
 	ErrTypeValidation     = "validation_error"
@@ -450,13 +462,152 @@ func (q *Query[T]) Extract(r *http.Request) error {
 	return nil
 }
 
-// Form[T] calls r.ParseForm and decodes r.Form into T using the schema decoder.
+// FilePart is a multipart file part extracted from a request.
+//
+// The underlying file stream is opened lazily by Open or Save. It can be
+// consumed only once.
+type FilePart struct {
+	Name        string
+	Filename    string
+	ContentType string
+	Size        int64
+
+	header   *multipart.FileHeader
+	consumed *atomic.Bool
+}
+
+// Open opens the uploaded file for streaming. The returned file must be closed.
+// Open and Save share the same one-shot consumption guard.
+func (p *FilePart) Open() (multipart.File, error) {
+	if p == nil || p.header == nil {
+		return nil, errors.New("mint: missing file part")
+	}
+	if p.consumed == nil || !p.consumed.CompareAndSwap(false, true) {
+		return nil, errors.New("mint: file already consumed")
+	}
+	file, err := p.header.Open()
+	if err != nil {
+		return nil, fmt.Errorf("open uploaded file %q: %w", p.Filename, err)
+	}
+	return file, nil
+}
+
+// Save streams the uploaded file to path. It creates parent directories as
+// needed and removes the target if copying or closing fails.
+func (p *FilePart) Save(path string) (err error) {
+	if path == "" {
+		return errors.New("mint: save path is required")
+	}
+	target := filepath.Clean(path)
+
+	in, err := p.Open()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := in.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+
+	if err = os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("create upload directory: %w", err)
+	}
+
+	out, err := os.Create(target)
+	if err != nil {
+		return fmt.Errorf("create upload target: %w", err)
+	}
+
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		err = fmt.Errorf("save uploaded file: %w", copyErr)
+	} else if closeErr != nil {
+		err = fmt.Errorf("close upload target: %w", closeErr)
+	}
+	if err != nil {
+		if removeErr := os.Remove(target); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, removeErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// Consumed reports whether Open or Save has consumed this file part.
+func (p *FilePart) Consumed() bool {
+	return p != nil && p.consumed != nil && p.consumed.Load()
+}
+
+// File extracts the first uploaded file from a multipart/form-data request.
+// For name-based file binding, use FilePart fields inside Form[T].
+type File struct {
+	Value FilePart
+}
+
+func (f *File) Extract(r *http.Request) error {
+	if err := parseRequestForm(r); err != nil {
+		if be := mapBodyReadError(err); be != nil {
+			if ee, ok := be.(*ExtractError); ok && ee.Type == ErrTypeBodyTooLarge {
+				return be
+			}
+		}
+		return NewFormParseError(err)
+	}
+
+	part, ok := firstFilePart(r.MultipartForm)
+	if !ok {
+		return NewFileMissingError("")
+	}
+	f.Value = part
+	return nil
+}
+
+// Open is a convenience wrapper around f.Value.Open.
+func (f *File) Open() (multipart.File, error) { return f.Value.Open() }
+
+// Save is a convenience wrapper around f.Value.Save.
+func (f *File) Save(path string) error { return f.Value.Save(path) }
+
+func newFilePart(name string, header *multipart.FileHeader) FilePart {
+	return FilePart{
+		Name:        name,
+		Filename:    header.Filename,
+		ContentType: header.Header.Get("Content-Type"),
+		Size:        header.Size,
+		header:      header,
+		consumed:    &atomic.Bool{},
+	}
+}
+
+func firstFilePart(form *multipart.Form) (FilePart, bool) {
+	if form == nil || len(form.File) == 0 {
+		return FilePart{}, false
+	}
+	names := make([]string, 0, len(form.File))
+	for name := range form.File {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		headers := nonNilFileHeaders(form.File[name])
+		if len(headers) > 0 {
+			return newFilePart(name, headers[0]), true
+		}
+	}
+	return FilePart{}, false
+}
+
+// Form[T] parses URL-encoded or multipart form data and decodes r.Form into T
+// using the schema decoder. In multipart requests, FilePart fields are bound
+// from file parts by their schema/form tag name.
 type Form[T any] struct {
 	Value T
 }
 
 func (f *Form[T]) Extract(r *http.Request) error {
-	if err := r.ParseForm(); err != nil {
+	if err := parseRequestForm(r); err != nil {
 		// MaxBytesError surfaces here when the form body exceeds the cap.
 		if be := mapBodyReadError(err); be != nil {
 			if ee, ok := be.(*ExtractError); ok && ee.Type == ErrTypeBodyTooLarge {
@@ -472,10 +623,114 @@ func (f *Form[T]) Extract(r *http.Request) error {
 	if err := schemaDecoder().Decode(target, r.Form); err != nil {
 		return err
 	}
+	if err := bindMultipartFiles(target, r.MultipartForm); err != nil {
+		return err
+	}
 	if err := validate(target); err != nil {
 		return NewValidationError(err)
 	}
 	return nil
+}
+
+func parseRequestForm(r *http.Request) error {
+	if isMultipartForm(r) {
+		return r.ParseMultipartForm(DefaultMultipartMemory)
+	}
+	return r.ParseForm()
+}
+
+func isMultipartForm(r *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && strings.EqualFold(mediaType, "multipart/form-data")
+}
+
+func bindMultipartFiles(target any, form *multipart.Form) error {
+	if form == nil || len(form.File) == 0 {
+		return nil
+	}
+
+	v := reflect.ValueOf(target)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return nil
+	}
+	v = v.Elem()
+	if v.Kind() != reflect.Struct {
+		return nil
+	}
+
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !sf.IsExported() {
+			continue
+		}
+		name, ok := formBindingName(sf)
+		if !ok {
+			continue
+		}
+		if err := setFileField(v.Field(i), name, form.File[name]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func formBindingName(field reflect.StructField) (string, bool) {
+	for _, tag := range []string{"schema", "form"} {
+		name := strings.SplitN(field.Tag.Get(tag), ",", 2)[0]
+		if name == "-" {
+			return "", false
+		}
+		if name != "" {
+			return name, true
+		}
+	}
+	return field.Name, true
+}
+
+func setFileField(field reflect.Value, name string, headers []*multipart.FileHeader) error {
+	headers = nonNilFileHeaders(headers)
+	if len(headers) == 0 || !field.CanSet() {
+		return nil
+	}
+
+	switch {
+	case field.Type() == filePartType:
+		field.Set(reflect.ValueOf(newFilePart(name, headers[0])))
+	case field.Type() == filePartPtrType:
+		part := newFilePart(name, headers[0])
+		field.Set(reflect.ValueOf(&part))
+	case field.Kind() == reflect.Slice && field.Type().Elem() == filePartType:
+		slice := reflect.MakeSlice(field.Type(), len(headers), len(headers))
+		for i, header := range headers {
+			slice.Index(i).Set(reflect.ValueOf(newFilePart(name, header)))
+		}
+		field.Set(slice)
+	case field.Kind() == reflect.Slice && field.Type().Elem() == filePartPtrType:
+		slice := reflect.MakeSlice(field.Type(), len(headers), len(headers))
+		for i, header := range headers {
+			part := newFilePart(name, header)
+			slice.Index(i).Set(reflect.ValueOf(&part))
+		}
+		field.Set(slice)
+	}
+	return nil
+}
+
+func nonNilFileHeaders(headers []*multipart.FileHeader) []*multipart.FileHeader {
+	for i, header := range headers {
+		if header == nil {
+			filtered := make([]*multipart.FileHeader, 0, len(headers)-1)
+			filtered = append(filtered, headers[:i]...)
+			for _, h := range headers[i+1:] {
+				if h != nil {
+					filtered = append(filtered, h)
+				}
+			}
+			return filtered
+		}
+	}
+	return headers
 }
 
 // Path[T] extracts a single path parameter from r.PathValue. The binding name
@@ -744,6 +999,18 @@ func NewFormParseError(err error) error {
 	}
 }
 
+func NewFileMissingError(field string) error {
+	msg := "missing uploaded file"
+	if field != "" {
+		msg = fmt.Sprintf("missing uploaded file: %s", field)
+	}
+	return &ExtractError{
+		Type:    ErrTypeFileMissing,
+		Field:   field,
+		Message: msg,
+	}
+}
+
 func NewPathConversionError(field, value, targetType string, err error) error {
 	return &ExtractError{
 		Type:    ErrTypePathConversion,
@@ -872,6 +1139,8 @@ var (
 	resultMarkerType   = reflect.TypeOf((*resultMarker)(nil)).Elem()
 	responseWriterType = reflect.TypeOf((*http.ResponseWriter)(nil)).Elem()
 	httpRequestType    = reflect.TypeOf((*http.Request)(nil))
+	filePartType       = reflect.TypeOf(FilePart{})
+	filePartPtrType    = reflect.TypeOf((*FilePart)(nil))
 )
 
 // H adapts fn into an http.HandlerFunc.
@@ -1364,6 +1633,8 @@ func extractErrorToHTTP(e *ExtractError) *HTTPError {
 		return &HTTPError{Code: http.StatusBadRequest, Err: "empty_body", Message: e.Message}
 	case ErrTypeFormParse:
 		return &HTTPError{Code: http.StatusBadRequest, Err: "invalid_form", Message: e.Message}
+	case ErrTypeFileMissing:
+		return &HTTPError{Code: http.StatusBadRequest, Err: "missing_file", Message: e.Message}
 	case ErrTypePathConversion:
 		return &HTTPError{Code: http.StatusBadRequest, Err: "invalid_path_parameter", Message: e.Message}
 	case ErrTypeMissingPath:
