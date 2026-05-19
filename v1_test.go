@@ -119,6 +119,27 @@ func TestBodySizeLimit_FormEnforced(t *testing.T) {
 	}
 }
 
+func TestBodySizeLimit_MultipartFormEnforced(t *testing.T) {
+	Reset()
+	defer Reset()
+	Configure(WithMaxRequestBodySize(16))
+
+	type F struct {
+		Username string `schema:"username"`
+	}
+	handler := H(func(f Form[F]) string { return f.Value.Username })
+
+	req := createMultipartRequest(t, map[string]string{
+		"username": strings.Repeat("a", 200),
+	}, nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413, got %d", rec.Code)
+	}
+}
+
 // =============================================================================
 // Default JSON encoding does NOT escape <, >, &
 // =============================================================================

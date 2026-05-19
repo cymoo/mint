@@ -14,6 +14,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,6 +53,11 @@ type ListUsersQuery struct {
 type LoginForm struct {
 	Username string `schema:"username" validate:"required"`
 	Password string `schema:"password" validate:"required,min=8"`
+}
+
+type UploadForm struct {
+	Title string      `schema:"title"`
+	File  *m.FilePart `schema:"file" validate:"required"`
 }
 
 type AuthHeaders struct {
@@ -100,14 +107,16 @@ func main() {
 	mux.HandleFunc("PUT    /users/{id}", m.H(updateUser))
 	mux.HandleFunc("DELETE /users/{id}", m.H(deleteUser))
 
-	// Query, Form, multi-Path
+	// Query, Form, Upload, multi-Path
 	mux.HandleFunc("GET  /search", m.H(search))
 	mux.HandleFunc("POST /login", m.H(login))
+	mux.HandleFunc("POST /upload/form", m.H(uploadMultipartForm))
+	mux.HandleFunc("POST /upload/file", m.H(uploadFile))
 	mux.HandleFunc("GET  /calc/{a}/{b}", m.H(calc))
 
 	// Header & Cookie extractors
-	mux.HandleFunc("GET /me", m.H(me))            // Authorization header
-	mux.HandleFunc("GET /session", m.H(session))  // session_id cookie
+	mux.HandleFunc("GET /me", m.H(me))           // Authorization header
+	mux.HandleFunc("GET /session", m.H(session)) // session_id cookie
 
 	// Custom Result, status-only, binary, HTML
 	mux.HandleFunc("GET /custom", m.H(customResult))
@@ -137,22 +146,22 @@ func main() {
 
 // home: simplest possible handler — return a string.
 //
-//   curl http://localhost:8080/
-//   "Welcome to Mint!"
+//	curl http://localhost:8080/
+//	"Welcome to Mint!"
 func home() string {
 	return "Welcome to Mint!"
 }
 
 // htmlPage: m.HTML sets Content-Type: text/html.
 //
-//   curl http://localhost:8080/html
+//	curl http://localhost:8080/html
 func htmlPage() m.HTML {
 	return `<h1>Hello</h1><p>This is an HTML response.</p>`
 }
 
 // listUsers: query parameters with validation.
 //
-//   curl 'http://localhost:8080/users?page=1&limit=20&sort=name'
+//	curl 'http://localhost:8080/users?page=1&limit=20&sort=name'
 func listUsers(q m.Query[ListUsersQuery]) []User {
 	storeMu.RLock()
 	defer storeMu.RUnlock()
@@ -165,8 +174,8 @@ func listUsers(q m.Query[ListUsersQuery]) []User {
 
 // getUser: a single typed path parameter + (T, error) return.
 //
-//   curl http://localhost:8080/users/1
-//   curl http://localhost:8080/users/999  # 404
+//	curl http://localhost:8080/users/1
+//	curl http://localhost:8080/users/999  # 404
 func getUser(id m.Path[int]) (User, error) {
 	storeMu.RLock()
 	defer storeMu.RUnlock()
@@ -183,9 +192,9 @@ func getUser(id m.Path[int]) (User, error) {
 
 // createUser: JSON body extraction + validation + Result with custom status/headers.
 //
-//   curl -X POST http://localhost:8080/users \
-//        -H 'Content-Type: application/json' \
-//        -d '{"name":"Eve","email":"eve@example.com"}'
+//	curl -X POST http://localhost:8080/users \
+//	     -H 'Content-Type: application/json' \
+//	     -d '{"name":"Eve","email":"eve@example.com"}'
 func createUser(body m.JSON[CreateUserBody]) m.Result[User] {
 	storeMu.Lock()
 	defer storeMu.Unlock()
@@ -202,9 +211,9 @@ func createUser(body m.JSON[CreateUserBody]) m.Result[User] {
 
 // updateUser: Path[T] + JSON[T] together.
 //
-//   curl -X PUT http://localhost:8080/users/1 \
-//        -H 'Content-Type: application/json' \
-//        -d '{"name":"Alice Jr."}'
+//	curl -X PUT http://localhost:8080/users/1 \
+//	     -H 'Content-Type: application/json' \
+//	     -d '{"name":"Alice Jr."}'
 func updateUser(id m.Path[int], body m.JSON[UpdateUserBody]) (User, error) {
 	storeMu.Lock()
 	defer storeMu.Unlock()
@@ -224,7 +233,7 @@ func updateUser(id m.Path[int], body m.JSON[UpdateUserBody]) (User, error) {
 
 // deleteUser: status-only return.
 //
-//   curl -X DELETE http://localhost:8080/users/1 -i
+//	curl -X DELETE http://localhost:8080/users/1 -i
 func deleteUser(id m.Path[int]) (m.StatusCode, error) {
 	storeMu.Lock()
 	defer storeMu.Unlock()
@@ -237,7 +246,7 @@ func deleteUser(id m.Path[int]) (m.StatusCode, error) {
 
 // search: read-only query handler.
 //
-//   curl 'http://localhost:8080/search?q=alice&page=1&limit=10'
+//	curl 'http://localhost:8080/search?q=alice&page=1&limit=10'
 func search(q m.Query[struct {
 	Q     string `schema:"q"`
 	Page  int    `schema:"page"  validate:"gte=0"`
@@ -252,8 +261,8 @@ func search(q m.Query[struct {
 
 // login: form data extraction.
 //
-//   curl -X POST http://localhost:8080/login \
-//        -d 'username=alice&password=hunter22'
+//	curl -X POST http://localhost:8080/login \
+//	     -d 'username=alice&password=hunter22'
 func login(f m.Form[LoginForm]) map[string]string {
 	return map[string]string{
 		"status":   "ok",
@@ -262,11 +271,54 @@ func login(f m.Form[LoginForm]) map[string]string {
 	}
 }
 
+// uploadMultipartForm: multipart fields + named file binding through Form[T].
+//
+//	curl -X POST http://localhost:8080/upload/form \
+//	     -F 'title=avatar' \
+//	     -F 'file=@./README.md'
+func uploadMultipartForm(f m.Form[UploadForm]) (map[string]any, error) {
+	return saveUploaded("form", f.Value.Title, f.Value.File)
+}
+
+// uploadFile: direct file extraction when only the first uploaded file matters.
+//
+//	curl -X POST http://localhost:8080/upload/file \
+//	     -F 'file=@./README.md'
+func uploadFile(file m.File) (map[string]any, error) {
+	return saveUploaded("file", "", &file.Value)
+}
+
+func saveUploaded(mode, title string, file *m.FilePart) (map[string]any, error) {
+	if file == nil {
+		return nil, &m.HTTPError{Code: 400, Err: "missing_file", Message: "file is required"}
+	}
+	filename := filepath.Base(file.Filename)
+	if filename == "" || filename == "." || filename == string(filepath.Separator) {
+		return nil, &m.HTTPError{Code: 400, Err: "invalid_filename", Message: "filename is required"}
+	}
+
+	target := filepath.Join(os.TempDir(), "mint-uploads", filename)
+	if err := file.Save(target); err != nil {
+		return nil, err
+	}
+
+	return map[string]any{
+		"status":       "saved",
+		"mode":         mode,
+		"title":        title,
+		"field":        file.Name,
+		"filename":     file.Filename,
+		"content_type": file.ContentType,
+		"size":         file.Size,
+		"saved_to":     target,
+	}, nil
+}
+
 // calc: multiple path parameters with different types.
 //
 // ⚠️ Positional binding: the first Path[T] gets {a}, the second gets {b}.
 //
-//   curl http://localhost:8080/calc/3/4.5
+//	curl http://localhost:8080/calc/3/4.5
 func calc(a m.Path[int], b m.Path[float64]) map[string]any {
 	return map[string]any{
 		"sum":     float64(a.Value) + b.Value,
@@ -276,7 +328,7 @@ func calc(a m.Path[int], b m.Path[float64]) map[string]any {
 
 // me: Header[T] extraction for an Authorization header.
 //
-//   curl http://localhost:8080/me -H 'Authorization: Bearer xyz' -H 'X-Request-ID: r1'
+//	curl http://localhost:8080/me -H 'Authorization: Bearer xyz' -H 'X-Request-ID: r1'
 func me(h m.Header[AuthHeaders]) map[string]string {
 	return map[string]string{
 		"token":      h.Value.Token,
@@ -286,7 +338,7 @@ func me(h m.Header[AuthHeaders]) map[string]string {
 
 // session: Cookie[T] extraction.
 //
-//   curl http://localhost:8080/session --cookie 'session_id=abc; theme=dark'
+//	curl http://localhost:8080/session --cookie 'session_id=abc; theme=dark'
 func session(c m.Cookie[SessionCookies]) map[string]string {
 	return map[string]string{
 		"session_id": c.Value.SessionID,
@@ -296,7 +348,7 @@ func session(c m.Cookie[SessionCookies]) map[string]string {
 
 // customResult: Result with custom headers.
 //
-//   curl -i http://localhost:8080/custom
+//	curl -i http://localhost:8080/custom
 func customResult() m.Result[map[string]any] {
 	return m.Result[map[string]any]{
 		Code: 200,
@@ -310,12 +362,12 @@ func customResult() m.Result[map[string]any] {
 
 // statusOnly: bare m.StatusCode.
 //
-//   curl -i http://localhost:8080/status
+//	curl -i http://localhost:8080/status
 func statusOnly() m.StatusCode { return 202 }
 
 // csv: []byte body. Use Content-Type via raw access for non-octet types.
 //
-//   curl http://localhost:8080/csv
+//	curl http://localhost:8080/csv
 func csv() []byte {
 	var b strings.Builder
 	b.WriteString("id,name,email\n")
@@ -329,43 +381,43 @@ func csv() []byte {
 
 // download: stream from an io.Reader.
 //
-//   curl http://localhost:8080/download/hello.txt
+//	curl http://localhost:8080/download/hello.txt
 func download(name m.Path[string]) io.Reader {
 	return strings.NewReader("contents of " + name.Value + "\n")
 }
 
 // genericErr: a plain error → Mint guesses status from the message.
 //
-//   curl -i http://localhost:8080/err/generic
-//   # 500, message hidden, original logged
+//	curl -i http://localhost:8080/err/generic
+//	# 500, message hidden, original logged
 func genericErr() error {
 	return errors.New("something internal failed")
 }
 
 // http4xx: 4xx errors keep their message in the response.
 //
-//   curl -i http://localhost:8080/err/4xx
+//	curl -i http://localhost:8080/err/4xx
 func http4xx() error {
 	return errors.New("invalid request: missing field x")
 }
 
 // http5xx: explicit *HTTPError lets you override the default visibility.
 //
-//   curl -i http://localhost:8080/err/5xx
+//	curl -i http://localhost:8080/err/5xx
 func http5xx() error {
 	return &m.HTTPError{Code: 503, Err: "unavailable", Message: "DB is down"}
 }
 
 // teapot: any custom code via *HTTPError.
 //
-//   curl -i http://localhost:8080/err/teapot
+//	curl -i http://localhost:8080/err/teapot
 func teapot() error {
 	return &m.HTTPError{Code: 418, Err: "teapot", Message: "I'm a teapot"}
 }
 
 // sse: Server-Sent Events using the wrapped ResponseWriter's Flusher.
 //
-//   curl -N http://localhost:8080/sse
+//	curl -N http://localhost:8080/sse
 func sse(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -391,7 +443,7 @@ func sse(w http.ResponseWriter, r *http.Request) {
 
 // raw: full access to ResponseWriter and Request — no Mint magic.
 //
-//   curl -i http://localhost:8080/raw
+//	curl -i http://localhost:8080/raw
 func raw(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Raw", "yes")
 	fmt.Fprintln(w, "Method:", r.Method)
