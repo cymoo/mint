@@ -260,7 +260,9 @@ Mint returns **400** at request time (and logs a one-time warning).
 
 `{name...}` wildcards bind like any other placeholder (use
 `Path[string]`); an empty remainder — e.g. `GET /files/` against
-`/files/{p...}` — is a legitimate match and yields `""`.
+`/files/{p...}` — is a legitimate match and yields `""`. This applies to
+`Path[string]` only: a non-string wildcard binding cannot represent an
+empty match and still returns 400.
 
 ### `Header[T]`
 

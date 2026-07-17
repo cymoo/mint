@@ -19,7 +19,9 @@ shape as noted below.
   pointer embeds), mirroring how the schema decoder promotes value fields.
 - **`{name...}` wildcard placeholders** bind to `Path[string]` and accept
   an empty remainder: `GET /files/` against `/files/{p...}` now yields
-  `""` instead of `400 missing_path_parameter`.
+  `""` instead of `400 missing_path_parameter`. String bindings only —
+  non-string `Path[T]` wildcards still 400 on an empty match, since the
+  zero value would be indistinguishable from a real `0` segment.
 
 ### New registration-time checks (H panics at startup)
 

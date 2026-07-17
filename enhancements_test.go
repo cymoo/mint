@@ -216,6 +216,9 @@ func TestPath_WildcardEmptyMatch(t *testing.T) {
 	mux.HandleFunc("GET /files/{p...}", H(func(p Path[string]) string {
 		return "got:" + p.Value
 	}))
+	mux.HandleFunc("GET /nums/{n...}", H(func(n Path[int]) string {
+		return fmt.Sprint(n.Value)
+	}))
 
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/files/a/b/c", nil))
@@ -227,5 +230,19 @@ func TestPath_WildcardEmptyMatch(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/files/", nil))
 	if rec.Code != 200 || rec.Body.String() != "got:" {
 		t.Errorf("empty wildcard match must be 200, got %d/%q", rec.Code, rec.Body.String())
+	}
+
+	// A non-string wildcard binding cannot represent "empty": the zero
+	// value would be indistinguishable from a real "0" segment, so an
+	// empty match stays a 400.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/nums/42", nil))
+	if rec.Body.String() != "42" {
+		t.Errorf("unexpected body: %q", rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/nums/", nil))
+	if rec.Code != 400 {
+		t.Errorf("empty non-string wildcard match must be 400, got %d/%q", rec.Code, rec.Body.String())
 	}
 }

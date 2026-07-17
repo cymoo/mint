@@ -914,9 +914,11 @@ func (p *Path[T]) setWildcard() { p.wildcard = true }
 func (p *Path[T]) Extract(r *http.Request) error {
 	pv := r.PathValue(p.key)
 	if pv == "" {
-		if p.wildcard {
-			// "/files/" matched against "/files/{name...}" is a valid,
-			// empty remainder; leave the zero value.
+		// "/files/" matched against "/files/{name...}" is a valid, empty
+		// remainder — but only a string can represent it faithfully. For
+		// non-string T the zero value would be indistinguishable from a
+		// real "0"/"false" segment, so an empty match stays an error.
+		if p.wildcard && reflect.ValueOf(p.Value).Kind() == reflect.String {
 			return nil
 		}
 		return NewMissingPathError(p.key)
