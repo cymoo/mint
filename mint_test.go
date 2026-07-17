@@ -1299,7 +1299,7 @@ func TestInferErrorType(t *testing.T) {
 		{404, "not_found"},
 		{408, "timeout"},
 		{500, "internal_error"},
-		{503, "internal_error"},
+		{503, "service_unavailable"},
 	}
 
 	for _, tt := range tests {
@@ -1317,27 +1317,30 @@ func TestInferErrorType(t *testing.T) {
 func TestExtractPatternNames(t *testing.T) {
 	tests := []struct {
 		pattern  string
-		expected []string
+		expected []pathKey
 	}{
-		{"/users/{id}", []string{"id"}},
-		{"/users/{id}/posts/{postId}", []string{"id", "postId"}},
-		{"/items/{category}/{id}", []string{"category", "id"}},
-		{"/static/file.txt", []string{}},
-		{"/users/{id}/", []string{"id"}},
-		{"/api/{version}/users/{id}", []string{"version", "id"}},
-		{"/", []string{}},
-		{"/{single}", []string{"single"}},
+		{"/users/{id}", []pathKey{{name: "id"}}},
+		{"/users/{id}/posts/{postId}", []pathKey{{name: "id"}, {name: "postId"}}},
+		{"/items/{category}/{id}", []pathKey{{name: "category"}, {name: "id"}}},
+		{"/static/file.txt", []pathKey{}},
+		{"/users/{id}/", []pathKey{{name: "id"}}},
+		{"/api/{version}/users/{id}", []pathKey{{name: "version"}, {name: "id"}}},
+		{"/", []pathKey{}},
+		{"/{single}", []pathKey{{name: "single"}}},
+		{"/files/{path...}", []pathKey{{name: "path", wildcard: true}}},
+		{"/x/{id}/y/{rest...}", []pathKey{{name: "id"}, {name: "rest", wildcard: true}}},
+		{"/exact/{$}", []pathKey{}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.pattern, func(t *testing.T) {
 			result := extractPatternNames(tt.pattern)
 			if len(result) != len(tt.expected) {
-				t.Fatalf("expected %d names, got %d", len(tt.expected), len(result))
+				t.Fatalf("expected %d keys, got %d", len(tt.expected), len(result))
 			}
-			for i, name := range tt.expected {
-				if result[i] != name {
-					t.Errorf("expected name[%d]=%s, got %s", i, name, result[i])
+			for i, key := range tt.expected {
+				if result[i] != key {
+					t.Errorf("expected key[%d]=%+v, got %+v", i, key, result[i])
 				}
 			}
 		})

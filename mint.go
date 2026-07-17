@@ -10,6 +10,7 @@ package m
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/gorilla/schema"
@@ -52,6 +54,7 @@ const (
 	ErrTypeBodyRead       = "body_read_error"
 	ErrTypeBodyTooLarge   = "body_too_large"
 	ErrTypeEmptyBody      = "empty_body"
+	ErrTypeJSONDecode     = "json_decode_error"
 	ErrTypeFormParse      = "form_parse_error"
 	ErrTypeFileMissing    = "file_missing"
 	ErrTypePathConversion = "path_conversion_error"
@@ -101,6 +104,11 @@ type Config struct {
 	// consuming extractors (JSON, Form). Defaults to DefaultMaxRequestBodySize.
 	// Set to <= 0 to disable.
 	MaxRequestBodySize int64
+
+	// MultipartMemory is the in-memory budget passed to ParseMultipartForm
+	// for multipart requests; parts beyond it spill to temporary files.
+	// Values <= 0 fall back to DefaultMultipartMemory (32 MiB).
+	MultipartMemory int64
 }
 
 // Option is a functional option for configuring the framework.
@@ -156,6 +164,12 @@ func WithMaxRequestBodySize(n int64) Option {
 	return func(c *Config) { c.MaxRequestBodySize = n }
 }
 
+// WithMultipartMemory sets the in-memory budget for parsing multipart forms.
+// A value <= 0 falls back to DefaultMultipartMemory.
+func WithMultipartMemory(n int64) Option {
+	return func(c *Config) { c.MultipartMemory = n }
+}
+
 // defaultConfig returns a Config with sensible defaults.
 func defaultConfig() *Config {
 	return &Config{
@@ -166,14 +180,29 @@ func defaultConfig() *Config {
 		JSONEncodeFunc:     defaultJSONEncode,
 		JSONUnmarshalFunc:  json.Unmarshal,
 		MaxRequestBodySize: DefaultMaxRequestBodySize,
+		MultipartMemory:    DefaultMultipartMemory,
 	}
 }
+
+// jsonBufPool recycles encode buffers across requests. Buffers that grew
+// beyond maxPooledBufferSize are dropped so one huge response doesn't pin
+// memory forever.
+var jsonBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+const maxPooledBufferSize = 1 << 20 // 1 MiB
 
 // defaultJSONEncode marshals v as JSON without escaping <, >, &, and without
 // the trailing newline that json.Encoder.Encode adds.
 func defaultJSONEncode(w io.Writer, v any) error {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
+	buf := jsonBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		if buf.Cap() <= maxPooledBufferSize {
+			jsonBufPool.Put(buf)
+		}
+	}()
+
+	enc := json.NewEncoder(buf)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(v); err != nil {
 		return err
@@ -210,16 +239,21 @@ func newDefaultValidator() *validator.Validate {
 	return v
 }
 
-// configManager manages the global configuration safely across goroutines.
+// configManager manages the global configuration. Reads are lock-free
+// (atomic pointer load, requests never contend); writers are serialized by mu
+// and publish a fresh *Config, so a Config is immutable once stored.
 type configManager struct {
-	mu          sync.RWMutex
-	config      *Config
-	once        sync.Once
-	initialized bool
+	mu     sync.Mutex // serializes Initialize/Configure/Reset
+	config atomic.Pointer[Config]
+	once   sync.Once
 }
 
-var global = &configManager{
-	config: defaultConfig(),
+var global = newConfigManager()
+
+func newConfigManager() *configManager {
+	cm := &configManager{}
+	cm.config.Store(defaultConfig())
+	return cm
 }
 
 // Initialize installs configuration once at application startup. The first
@@ -237,8 +271,7 @@ func Initialize(opts ...Option) {
 			cfg.Validator = newDefaultValidator()
 		}
 		global.mu.Lock()
-		global.config = cfg
-		global.initialized = true
+		global.config.Store(cfg)
 		global.mu.Unlock()
 	})
 	if !called {
@@ -252,14 +285,14 @@ func Configure(opts ...Option) {
 	global.mu.Lock()
 	defer global.mu.Unlock()
 
-	newCfg := *global.config
+	newCfg := *global.config.Load()
 	for _, opt := range opts {
 		opt(&newCfg)
 	}
 	if newCfg.EnableValidation && newCfg.Validator == nil {
 		newCfg.Validator = newDefaultValidator()
 	}
-	global.config = &newCfg
+	global.config.Store(&newCfg)
 }
 
 // Reset restores defaults and clears the one-shot Initialize flag.
@@ -267,15 +300,12 @@ func Configure(opts ...Option) {
 func Reset() {
 	global.mu.Lock()
 	defer global.mu.Unlock()
-	global.config = defaultConfig()
+	global.config.Store(defaultConfig())
 	global.once = sync.Once{}
-	global.initialized = false
 }
 
 func (cm *configManager) get() *Config {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-	return cm.config
+	return cm.config.Load()
 }
 
 // --- internal accessors -----------------------------------------------------
@@ -323,6 +353,19 @@ func validate(v any) error {
 	if !cfg.EnableValidation || cfg.Validator == nil {
 		return nil
 	}
+	rv := reflect.ValueOf(v)
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	// validator.Struct only accepts struct types (and rejects time.Time
+	// convertible ones); anything else — slices, maps, scalars — would come
+	// back as InvalidValidationError and fail perfectly valid requests.
+	if rv.Kind() != reflect.Struct || rv.Type().ConvertibleTo(timeType) {
+		return nil
+	}
 	return cfg.Validator.Struct(v)
 }
 
@@ -332,6 +375,13 @@ func errorHandler() func(w http.ResponseWriter, err error) {
 
 func maxBodySize() int64 {
 	return global.get().MaxRequestBodySize
+}
+
+func multipartMemory() int64 {
+	if n := global.get().MultipartMemory; n > 0 {
+		return n
+	}
+	return DefaultMultipartMemory
 }
 
 // =============================================================================
@@ -400,6 +450,38 @@ type KeySetter interface {
 	SetKey(string)
 }
 
+// registrationChecker lets built-in extractors validate their type parameter
+// when the handler is registered, so misconfigured handlers panic at startup
+// instead of failing every request.
+type registrationChecker interface {
+	checkRegistration() error
+}
+
+// wildcardSetter marks a Path extractor as bound to a {name...} wildcard,
+// for which an empty remainder is a legitimate match.
+type wildcardSetter interface {
+	setWildcard()
+}
+
+// rawBodyConsumer / parsedFormConsumer tag the built-in extractors that read
+// the request body, so H() can reject handlers that would consume it twice.
+type rawBodyConsumer interface{ consumesRawBody() }
+type parsedFormConsumer interface{ consumesParsedForm() }
+
+// requireStructT enforces that an extractor's type parameter is a struct
+// (possibly behind pointers).
+func requireStructT[T any](extractor string) error {
+	t := reflect.TypeFor[T]()
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return fmt.Errorf("%s requires a struct type parameter, got %s",
+			extractor, reflect.TypeFor[T]().String())
+	}
+	return nil
+}
+
 // Responder lets a return type fully control how it's written to the response.
 type Responder interface {
 	Respond(w http.ResponseWriter)
@@ -407,7 +489,10 @@ type Responder interface {
 
 // PathValue lists the scalar Go types supported by Path[T].
 type PathValue interface {
-	~string | ~int | ~int64 | ~uint | ~uint64 | ~float64 | ~bool
+	~string |
+		~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr |
+		~float32 | ~float64 | ~bool
 }
 
 // =============================================================================
@@ -419,6 +504,8 @@ type PathValue interface {
 type JSON[T any] struct {
 	Value T
 }
+
+func (*JSON[T]) consumesRawBody() {}
 
 func (j *JSON[T]) Extract(r *http.Request) error {
 	defer r.Body.Close()
@@ -436,7 +523,9 @@ func (j *JSON[T]) Extract(r *http.Request) error {
 	target := getPointer(val)
 
 	if err := jsonUnmarshal(body, target); err != nil {
-		return err
+		// Wrap so unknown error types from a custom JSONUnmarshalFunc still
+		// map to 400 instead of falling through to the 500 heuristics.
+		return NewJSONDecodeError(err)
 	}
 	if err := validate(target); err != nil {
 		return NewValidationError(err)
@@ -448,6 +537,8 @@ func (j *JSON[T]) Extract(r *http.Request) error {
 type Query[T any] struct {
 	Value T
 }
+
+func (*Query[T]) checkRegistration() error { return requireStructT[T]("Query[T]") }
 
 func (q *Query[T]) Extract(r *http.Request) error {
 	val := reflect.ValueOf(&q.Value).Elem()
@@ -546,14 +637,11 @@ type File struct {
 	Value FilePart
 }
 
+func (*File) consumesParsedForm() {}
+
 func (f *File) Extract(r *http.Request) error {
 	if err := parseRequestForm(r); err != nil {
-		if be := mapBodyReadError(err); be != nil {
-			if ee, ok := be.(*ExtractError); ok && ee.Type == ErrTypeBodyTooLarge {
-				return be
-			}
-		}
-		return NewFormParseError(err)
+		return mapFormParseError(err)
 	}
 
 	part, ok := firstFilePart(r.MultipartForm)
@@ -606,15 +694,13 @@ type Form[T any] struct {
 	Value T
 }
 
+func (*Form[T]) checkRegistration() error { return requireStructT[T]("Form[T]") }
+
+func (*Form[T]) consumesParsedForm() {}
+
 func (f *Form[T]) Extract(r *http.Request) error {
 	if err := parseRequestForm(r); err != nil {
-		// MaxBytesError surfaces here when the form body exceeds the cap.
-		if be := mapBodyReadError(err); be != nil {
-			if ee, ok := be.(*ExtractError); ok && ee.Type == ErrTypeBodyTooLarge {
-				return be
-			}
-		}
-		return NewFormParseError(err)
+		return mapFormParseError(err)
 	}
 
 	val := reflect.ValueOf(&f.Value).Elem()
@@ -634,7 +720,7 @@ func (f *Form[T]) Extract(r *http.Request) error {
 
 func parseRequestForm(r *http.Request) error {
 	if isMultipartForm(r) {
-		return r.ParseMultipartForm(DefaultMultipartMemory)
+		return r.ParseMultipartForm(multipartMemory())
 	}
 	return r.ParseForm()
 }
@@ -657,7 +743,17 @@ func bindMultipartFiles(target any, form *multipart.Form) error {
 	if v.Kind() != reflect.Struct {
 		return nil
 	}
+	return bindFilesToStruct(v, form, 0)
+}
 
+// maxEmbedDepth bounds recursion through embedded structs; a pointer-embed
+// cycle would otherwise loop forever.
+const maxEmbedDepth = 16
+
+func bindFilesToStruct(v reflect.Value, form *multipart.Form, depth int) error {
+	if depth > maxEmbedDepth {
+		return nil
+	}
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
@@ -668,11 +764,71 @@ func bindMultipartFiles(target any, form *multipart.Form) error {
 		if !ok {
 			continue
 		}
+		// Recurse into untagged embedded structs so promoted FilePart
+		// fields bind, mirroring how the schema decoder promotes values.
+		if sf.Anonymous && !hasExplicitFormName(sf) {
+			fv := v.Field(i)
+			if fv.Kind() == reflect.Pointer {
+				if fv.IsNil() {
+					if !fv.CanSet() || !typeHasFileParts(fv.Type().Elem(), depth+1) {
+						continue
+					}
+					fv.Set(reflect.New(fv.Type().Elem()))
+				}
+				fv = fv.Elem()
+			}
+			if fv.Kind() == reflect.Struct {
+				if err := bindFilesToStruct(fv, form, depth+1); err != nil {
+					return err
+				}
+				continue
+			}
+		}
 		if err := setFileField(v.Field(i), name, form.File[name]); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func hasExplicitFormName(field reflect.StructField) bool {
+	for _, tag := range []string{"schema", "form"} {
+		if name := strings.SplitN(field.Tag.Get(tag), ",", 2)[0]; name != "" && name != "-" {
+			return true
+		}
+	}
+	return false
+}
+
+// typeHasFileParts reports whether t (a struct type) contains any field a
+// multipart file could bind to, directly or via embedded structs.
+func typeHasFileParts(t reflect.Type, depth int) bool {
+	if depth > maxEmbedDepth || t.Kind() != reflect.Struct {
+		return false
+	}
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !sf.IsExported() {
+			continue
+		}
+		ft := sf.Type
+		switch {
+		case ft == filePartType, ft == filePartPtrType:
+			return true
+		case ft.Kind() == reflect.Slice && (ft.Elem() == filePartType || ft.Elem() == filePartPtrType):
+			return true
+		}
+		if sf.Anonymous {
+			et := ft
+			if et.Kind() == reflect.Pointer {
+				et = et.Elem()
+			}
+			if typeHasFileParts(et, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func formBindingName(field reflect.StructField) (string, bool) {
@@ -739,7 +895,8 @@ func nonNilFileHeaders(headers []*multipart.FileHeader) []*multipart.FileHeader 
 type Path[T PathValue] struct {
 	Value T
 
-	key string
+	key      string
+	wildcard bool
 }
 
 // SetKey is invoked by the framework. Manually calling it before H() invokes
@@ -750,9 +907,20 @@ func (p *Path[T]) SetKey(key string) { p.key = key }
 // Useful for debugging and custom error reporting.
 func (p *Path[T]) Key() string { return p.key }
 
+// setWildcard is invoked by the framework when the bound placeholder is a
+// {name...} wildcard, whose empty match is legitimate.
+func (p *Path[T]) setWildcard() { p.wildcard = true }
+
 func (p *Path[T]) Extract(r *http.Request) error {
 	pv := r.PathValue(p.key)
 	if pv == "" {
+		// "/files/" matched against "/files/{name...}" is a valid, empty
+		// remainder — but only a string can represent it faithfully. For
+		// non-string T the zero value would be indistinguishable from a
+		// real "0"/"false" segment, so an empty match stays an error.
+		if p.wildcard && reflect.ValueOf(p.Value).Kind() == reflect.String {
+			return nil
+		}
 		return NewMissingPathError(p.key)
 	}
 
@@ -805,6 +973,8 @@ func (p *Path[T]) Extract(r *http.Request) error {
 type Header[T any] struct {
 	Value T
 }
+
+func (*Header[T]) checkRegistration() error { return requireStructT[T]("Header[T]") }
 
 func (h *Header[T]) Extract(r *http.Request) error {
 	val := reflect.ValueOf(&h.Value).Elem()
@@ -859,6 +1029,8 @@ func (h *Header[T]) Extract(r *http.Request) error {
 type Cookie[T any] struct {
 	Value T
 }
+
+func (*Cookie[T]) checkRegistration() error { return requireStructT[T]("Cookie[T]") }
 
 func (c *Cookie[T]) Extract(r *http.Request) error {
 	val := reflect.ValueOf(&c.Value).Elem()
@@ -991,6 +1163,16 @@ func NewEmptyBodyError() error {
 	return &ExtractError{Type: ErrTypeEmptyBody, Message: "request body is required"}
 }
 
+// NewJSONDecodeError wraps a JSON unmarshaling failure so it maps to 400 even
+// when a custom JSONUnmarshalFunc returns unrecognized error types.
+func NewJSONDecodeError(err error) error {
+	return &ExtractError{
+		Type:    ErrTypeJSONDecode,
+		Message: "invalid JSON body",
+		Err:     err,
+	}
+}
+
 func NewFormParseError(err error) error {
 	return &ExtractError{
 		Type:    ErrTypeFormParse,
@@ -1050,6 +1232,27 @@ func mapBodyReadError(err error) error {
 	return NewBodyReadError(err)
 }
 
+// mapFormParseError converts a form/multipart parsing failure into the most
+// specific ExtractError: size overflows (the MaxBytesReader cap or the
+// multipart memory budget) become 413, everything else a 400 parse error.
+func mapFormParseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var be *http.MaxBytesError
+	if errors.As(err, &be) {
+		return NewBodyTooLargeError(err)
+	}
+	if errors.Is(err, multipart.ErrMessageTooLarge) {
+		return &ExtractError{
+			Type:    ErrTypeBodyTooLarge,
+			Message: "multipart form data too large",
+			Err:     err,
+		}
+	}
+	return NewFormParseError(err)
+}
+
 // =============================================================================
 // ResponseWriter wrapper
 // =============================================================================
@@ -1072,6 +1275,10 @@ func (rw *ResponseWriter) WriteHeader(code int) {
 	}
 	if code <= 0 {
 		code = http.StatusOK
+	} else if code < 100 || code > 999 {
+		// net/http panics on out-of-range codes; fail the request instead.
+		logger().Printf("mint: invalid status code %d; writing 500", code)
+		code = http.StatusInternalServerError
 	}
 	rw.statusCode = code
 	rw.headerWritten = true
@@ -1100,6 +1307,13 @@ func (rw *ResponseWriter) Unwrap() http.ResponseWriter { return rw.ResponseWrite
 // type-assert before flushing.
 func (rw *ResponseWriter) Flush() {
 	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		// The first flush on a live connection sends the headers with an
+		// implicit 200; record that so later WriteHeader calls are treated
+		// as the duplicates they are.
+		if !rw.headerWritten {
+			rw.headerWritten = true
+			rw.statusCode = http.StatusOK
+		}
 		f.Flush()
 	}
 }
@@ -1139,9 +1353,69 @@ var (
 	resultMarkerType   = reflect.TypeOf((*resultMarker)(nil)).Elem()
 	responseWriterType = reflect.TypeOf((*http.ResponseWriter)(nil)).Elem()
 	httpRequestType    = reflect.TypeOf((*http.Request)(nil))
+	contextType        = reflect.TypeOf((*context.Context)(nil)).Elem()
 	filePartType       = reflect.TypeOf(FilePart{})
 	filePartPtrType    = reflect.TypeOf((*FilePart)(nil))
+	timeType           = reflect.TypeOf(time.Time{})
+
+	keySetterType          = reflect.TypeOf((*KeySetter)(nil)).Elem()
+	rawBodyConsumerType    = reflect.TypeOf((*rawBodyConsumer)(nil)).Elem()
+	parsedFormConsumerType = reflect.TypeOf((*parsedFormConsumer)(nil)).Elem()
+
+	// responseWriterConcrete is the wrapper handed to handlers; custom
+	// writer interfaces must be satisfiable by it.
+	responseWriterConcrete = reflect.TypeOf((*ResponseWriter)(nil))
 )
+
+// paramKind classifies a handler parameter; decided once at registration.
+type paramKind uint8
+
+const (
+	paramKindExtractor paramKind = iota
+	paramKindResponseWriter
+	paramKindRequest
+	paramKindContext
+)
+
+// paramPlan is the per-parameter dispatch decision, computed by H() at
+// registration so the request hot path does no interface probing.
+type paramPlan struct {
+	typ       reflect.Type
+	kind      paramKind
+	keySetter bool
+}
+
+func buildParamPlan(pt reflect.Type) (paramPlan, error) {
+	switch {
+	case isExtractorParam(pt):
+		if checker, ok := reflect.New(pt).Interface().(registrationChecker); ok {
+			if err := checker.checkRegistration(); err != nil {
+				return paramPlan{}, err
+			}
+		}
+		return paramPlan{
+			typ:       pt,
+			kind:      paramKindExtractor,
+			keySetter: reflect.PointerTo(pt).Implements(keySetterType),
+		}, nil
+
+	case pt == contextType:
+		return paramPlan{typ: pt, kind: paramKindContext}, nil
+
+	case pt == httpRequestType:
+		return paramPlan{typ: pt, kind: paramKindRequest}, nil
+
+	case pt.Kind() == reflect.Interface && pt.Implements(responseWriterType):
+		if !responseWriterConcrete.Implements(pt) {
+			return paramPlan{}, fmt.Errorf(
+				"writer interface %s cannot be satisfied by *mint.ResponseWriter (it only adds Flush/Hijack/Push/Unwrap/Status/Written)", pt)
+		}
+		return paramPlan{typ: pt, kind: paramKindResponseWriter}, nil
+
+	default:
+		return paramPlan{}, fmt.Errorf("unsupported parameter type %s", pt)
+	}
+}
 
 // H adapts fn into an http.HandlerFunc.
 //
@@ -1172,13 +1446,36 @@ func H(fn any) http.HandlerFunc {
 		panic("mint.H: handler function must not be nil")
 	}
 
-	paramTypes := make([]reflect.Type, fnType.NumIn())
+	// Everything about the signature is decided once, here: per-parameter
+	// dispatch plans (the hot path does no interface probing), extractor
+	// type-parameter checks, and body-consumption conflicts.
+	plans := make([]paramPlan, fnType.NumIn())
+	needsPathKeys := false
+	numRawBody, numParsedForm := 0, 0
 	for i := 0; i < fnType.NumIn(); i++ {
-		paramTypes[i] = fnType.In(i)
-		if !isSupportedParamType(paramTypes[i]) {
-			panic(fmt.Sprintf("mint.H: unsupported parameter type %s at position %d",
-				paramTypes[i].String(), i))
+		plan, err := buildParamPlan(fnType.In(i))
+		if err != nil {
+			panic(fmt.Sprintf("mint.H: %v at position %d", err, i))
 		}
+		plans[i] = plan
+		if plan.keySetter {
+			needsPathKeys = true
+		}
+		if plan.kind == paramKindExtractor {
+			ptr := reflect.PointerTo(plan.typ)
+			if ptr.Implements(rawBodyConsumerType) {
+				numRawBody++
+			}
+			if ptr.Implements(parsedFormConsumerType) {
+				numParsedForm++
+			}
+		}
+	}
+	if numRawBody > 1 {
+		panic("mint.H: multiple JSON extractors in one handler; the request body can be read only once")
+	}
+	if numRawBody >= 1 && numParsedForm >= 1 {
+		panic("mint.H: JSON and Form/File extractors in one handler would both consume the request body")
 	}
 
 	numOut := fnType.NumOut()
@@ -1211,22 +1508,29 @@ func H(fn any) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rw := &ResponseWriter{ResponseWriter: w}
 
-		// Enforce the body size cap once per request, before any extractor reads.
+		// Enforce the body size cap once per request, before any extractor
+		// reads. Pass the ORIGINAL writer: on overflow net/http recognizes
+		// its own response type (via an unexported interface) to stop
+		// reading and close the connection; the wrapper would hide it.
 		if maxN := maxBodySize(); maxN > 0 {
-			r.Body = http.MaxBytesReader(rw, r.Body, maxN)
+			r.Body = http.MaxBytesReader(w, r.Body, maxN)
 		}
 
-		args := make([]reflect.Value, len(paramTypes))
-		pathKeys := patternNames(r.Pattern)
+		args := make([]reflect.Value, len(plans))
+		var pathKeys []pathKey
+		if needsPathKeys {
+			pathKeys = patternKeys(r.Pattern)
+		}
 		keyIdx := 0
 
-		for i, paramType := range paramTypes {
-			switch {
-			case isExtractorParam(paramType):
-				paramVal := reflect.New(paramType).Elem()
+		for i := range plans {
+			plan := &plans[i]
+			switch plan.kind {
+			case paramKindExtractor:
+				paramVal := reflect.New(plan.typ).Elem()
 				extractor := paramVal.Addr().Interface().(Extractor)
 
-				if ks, ok := extractor.(KeySetter); ok {
+				if plan.keySetter {
 					if keyIdx >= len(pathKeys) {
 						// Pattern has fewer {placeholders} than Path-style
 						// extractors in this handler. Surface a clear error
@@ -1242,11 +1546,17 @@ func H(fn any) http.HandlerFunc {
 						}
 						return
 					}
-					ks.SetKey(pathKeys[keyIdx])
+					key := pathKeys[keyIdx]
+					extractor.(KeySetter).SetKey(key.name)
+					if key.wildcard {
+						if ws, ok := extractor.(wildcardSetter); ok {
+							ws.setWildcard()
+						}
+					}
 					keyIdx++
 				}
 
-				if err := extractor.Extract(r); err != nil {
+				if err := extractor.Extract(r); !isNilError(err) {
 					if e := handleError(rw, err); e != nil {
 						logger().Printf("mint: failed to write error response: %v", e)
 					}
@@ -1254,15 +1564,14 @@ func H(fn any) http.HandlerFunc {
 				}
 				args[i] = paramVal
 
-			case paramType.Kind() == reflect.Interface && paramType.Implements(responseWriterType):
+			case paramKindResponseWriter:
 				args[i] = reflect.ValueOf(rw)
 
-			case paramType == httpRequestType:
+			case paramKindRequest:
 				args[i] = reflect.ValueOf(r)
 
-			default:
-				panic(fmt.Sprintf("mint.H: unsupported parameter type %s at position %d",
-					paramType.String(), i))
+			case paramKindContext:
+				args[i] = reflect.ValueOf(r.Context())
 			}
 		}
 
@@ -1282,21 +1591,29 @@ func H(fn any) http.HandlerFunc {
 			}
 			if err := handleOneResult(rw, rv); err != nil {
 				logger().Printf("mint: failed to write response: %v", err)
+				writeInternalErrorFallback(rw)
 			}
 		case 2:
-			if isNilValue(results[0]) && isNilValue(results[1]) {
+			// A typed-nil error (e.g. `var e *HTTPError; return data, e`)
+			// must count as "no error", so check through the interface.
+			if !errorIsNil(results[1]) {
+				if err := handleError(rw, results[1].Interface().(error)); err != nil {
+					logger().Printf("mint: failed to write response: %v", err)
+					writeInternalErrorFallback(rw)
+				}
+				return
+			}
+			if isNilValue(results[0]) {
 				return
 			}
 			rv := results[0].Interface()
-			errVal := results[1].Interface()
-			if errVal == nil {
-				if handler, ok := rv.(http.Handler); ok {
-					handler.ServeHTTP(rw, r)
-					return
-				}
+			if handler, ok := rv.(http.Handler); ok {
+				handler.ServeHTTP(rw, r)
+				return
 			}
-			if err := handleTwoResults(rw, rv, errVal); err != nil {
+			if err := handleCommonTypes(rw, rv); err != nil {
 				logger().Printf("mint: failed to write response: %v", err)
+				writeInternalErrorFallback(rw)
 			}
 		}
 	}
@@ -1304,12 +1621,6 @@ func H(fn any) http.HandlerFunc {
 
 func isExtractorParam(paramType reflect.Type) bool {
 	return reflect.PointerTo(paramType).Implements(extractorType)
-}
-
-func isSupportedParamType(paramType reflect.Type) bool {
-	return isExtractorParam(paramType) ||
-		paramType == httpRequestType ||
-		(paramType.Kind() == reflect.Interface && paramType.Implements(responseWriterType))
 }
 
 func isSupportedSingleInterfaceReturn(rt reflect.Type) bool {
@@ -1427,6 +1738,41 @@ func isNilValue(v reflect.Value) bool {
 	}
 }
 
+// errorIsNil reports whether an error return slot holds no usable error:
+// a nil interface, a nil concrete pointer, or a typed-nil wrapped inside the
+// error interface (the classic `var e *MyErr; return data, e` trap).
+func errorIsNil(v reflect.Value) bool {
+	if !v.IsValid() {
+		return true
+	}
+	if v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return true
+		}
+		v = v.Elem()
+	}
+	return isNilValue(v)
+}
+
+// isNilError is errorIsNil for plain error values.
+func isNilError(err error) bool {
+	if err == nil {
+		return true
+	}
+	return errorIsNil(reflect.ValueOf(err))
+}
+
+// writeInternalErrorFallback emits a minimal 500 when nothing has been sent
+// yet, so a failed response write doesn't surface as an empty 200.
+func writeInternalErrorFallback(rw *ResponseWriter) {
+	if rw.Written() {
+		return
+	}
+	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rw.WriteHeader(http.StatusInternalServerError)
+	_, _ = io.WriteString(rw, `{"code":500,"error":"internal_error"}`)
+}
+
 func handleOneResult(w http.ResponseWriter, data any) error {
 	switch v := data.(type) {
 	case resultMarker:
@@ -1436,13 +1782,6 @@ func handleOneResult(w http.ResponseWriter, data any) error {
 	default:
 		return handleCommonTypes(w, data)
 	}
-}
-
-func handleTwoResults(w http.ResponseWriter, data any, err any) error {
-	if err != nil {
-		return handleError(w, err.(error))
-	}
-	return handleCommonTypes(w, data)
 }
 
 func handleCommonTypes(w http.ResponseWriter, data any) error {
@@ -1471,6 +1810,11 @@ func handleCommonTypes(w http.ResponseWriter, data any) error {
 		_, err := fmt.Fprint(w, v)
 		return err
 	case io.Reader:
+		// Close reader-owned resources (e.g. *os.File) once streamed;
+		// otherwise every request leaks a file descriptor.
+		if c, ok := v.(io.Closer); ok {
+			defer c.Close()
+		}
 		_, err := io.Copy(w, v)
 		return err
 	default:
@@ -1483,7 +1827,7 @@ func handleResult(w http.ResponseWriter, result Result[any]) error {
 	if result.Headers != nil {
 		WriteHeaders(w, result.Headers)
 	}
-	if result.Err != nil {
+	if !isNilError(result.Err) {
 		return handleErrorWithCode(w, result.Err, result.Code)
 	}
 	if result.Code != 0 {
@@ -1497,6 +1841,9 @@ func handleError(w http.ResponseWriter, err error) error {
 }
 
 func handleErrorWithCode(w http.ResponseWriter, err error, codeOverride int) error {
+	if isNilError(err) {
+		return nil
+	}
 	if eh := errorHandler(); eh != nil {
 		eh(w, err)
 		return nil
@@ -1507,17 +1854,9 @@ func handleErrorWithCode(w http.ResponseWriter, err error, codeOverride int) err
 		statusWritten = rw.headerWritten
 	}
 
-	httpErr := toHTTPError(err)
+	httpErr := toHTTPErrorWithCode(err, codeOverride)
 	if httpErr == nil {
 		return nil
-	}
-
-	if codeOverride != 0 {
-		httpErr = &HTTPError{
-			Code:    codeOverride,
-			Err:     inferErrorType(codeOverride),
-			Message: httpErr.Message,
-		}
 	}
 
 	setHeaderIfMissing(w, "Content-Type", "application/json; charset=utf-8")
@@ -1540,79 +1879,139 @@ func handleErrorWithCode(w http.ResponseWriter, err error, codeOverride int) err
 // did wrong). 5xx responses hide Message — the original error is logged
 // instead, so internal details don't leak.
 func toHTTPError(err error) *HTTPError {
+	return toHTTPErrorWithCode(err, 0)
+}
+
+// toHTTPErrorWithCode is toHTTPError with an optional status override
+// (Result.Code). The visibility policy is applied against the FINAL status
+// code, not the inferred one. An explicit HTTPError is respected verbatim —
+// the override only replaces its status code.
+func toHTTPErrorWithCode(err error, codeOverride int) *HTTPError {
 	if err == nil {
 		return nil
 	}
 
-	// 1. Explicit HTTPError wins.
+	// 1. Explicit HTTPError wins: Err and Message are kept regardless of code.
 	var httpErr *HTTPError
 	if errors.As(err, &httpErr) {
+		if httpErr == nil {
+			return nil
+		}
+		if codeOverride != 0 && codeOverride != httpErr.Code {
+			clone := *httpErr
+			clone.Code = codeOverride
+			return &clone
+		}
 		return httpErr
 	}
 	var httpErrVal HTTPError
 	if errors.As(err, &httpErrVal) {
+		if codeOverride != 0 {
+			httpErrVal.Code = codeOverride
+		}
 		return &httpErrVal
 	}
 
-	// 2. ExtractError → fixed mapping per Type.
+	out, generic := implicitHTTPError(err)
+	if codeOverride != 0 {
+		out.Code = codeOverride
+		if generic {
+			// The tag was derived from the inferred code; re-derive it from
+			// the code the handler actually asked for.
+			out.Err = inferErrorType(codeOverride)
+		}
+	}
+	// Visibility policy against the final code: clients may see what they
+	// did wrong (4xx); internals stay hidden (5xx, logged by the caller).
+	if out.Code >= 500 {
+		out.Message = ""
+	} else if generic && out.Message == "" {
+		out.Message = err.Error()
+	}
+	return out
+}
+
+// implicitHTTPError maps errors that are not HTTPError. The generic result
+// reports whether the mapping came from the message heuristics rather than a
+// known error type (whose curated Message and tag should be preserved).
+func implicitHTTPError(err error) (out *HTTPError, generic bool) {
+	// ExtractError → fixed mapping per Type.
 	var extractErr *ExtractError
 	if errors.As(err, &extractErr) {
-		return extractErrorToHTTP(extractErr)
+		return extractErrorToHTTP(extractErr), false
 	}
 
-	// 3. Well-known stdlib / dependency error types.
-	switch e := err.(type) {
-	case *http.MaxBytesError:
+	// Well-known stdlib / dependency error types.
+	if h := wellKnownErrorToHTTP(err); h != nil {
+		return h, false
+	}
+
+	// Last resort: infer the status from the error message.
+	code := inferStatusCode(err.Error())
+	return &HTTPError{Code: code, Err: inferErrorType(code)}, true
+}
+
+// wellKnownErrorToHTTP maps well-known stdlib / dependency error types.
+// errors.As is used throughout so wrapped errors are recognized too.
+func wellKnownErrorToHTTP(err error) *HTTPError {
+	if err == nil {
+		return nil
+	}
+
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
 		return &HTTPError{
 			Code:    http.StatusRequestEntityTooLarge,
 			Err:     "body_too_large",
-			Message: fmt.Sprintf("request body exceeds %d bytes", e.Limit),
+			Message: fmt.Sprintf("request body exceeds %d bytes", maxBytesErr.Limit),
 		}
-	case *json.UnmarshalTypeError:
+	}
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
 		return &HTTPError{
 			Code:    http.StatusBadRequest,
 			Err:     "invalid_json_type",
-			Message: fmt.Sprintf("field %q expects %s but got %s", e.Field, e.Type.String(), e.Value),
+			Message: fmt.Sprintf("field %q expects %s but got %s", typeErr.Field, typeErr.Type.String(), typeErr.Value),
 		}
-	case *json.SyntaxError:
+	}
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
 		return &HTTPError{
 			Code:    http.StatusBadRequest,
 			Err:     "invalid_json_syntax",
 			Message: "invalid JSON syntax",
 		}
-	case schema.MultiError:
-		msgs := make([]string, 0, len(e))
-		for field, fieldErr := range e {
+	}
+	var multiErr schema.MultiError
+	if errors.As(err, &multiErr) {
+		msgs := make([]string, 0, len(multiErr))
+		for field, fieldErr := range multiErr {
 			msgs = append(msgs, fmt.Sprintf("%s: %s", field, fieldErr.Error()))
 		}
+		sort.Strings(msgs) // map order is random; keep responses deterministic
 		return &HTTPError{
 			Code:    http.StatusBadRequest,
 			Err:     "validation_failed",
 			Message: strings.Join(msgs, "; "),
 		}
-	case *schema.ConversionError:
+	}
+	var convErr *schema.ConversionError
+	if errors.As(err, &convErr) {
 		return &HTTPError{
 			Code:    http.StatusBadRequest,
 			Err:     "conversion_failed",
-			Message: fmt.Sprintf("cannot convert field %q", e.Key),
+			Message: fmt.Sprintf("cannot convert field %q", convErr.Key),
 		}
-	case *schema.UnknownKeyError:
+	}
+	var unknownKeyErr *schema.UnknownKeyError
+	if errors.As(err, &unknownKeyErr) {
 		return &HTTPError{
 			Code:    http.StatusBadRequest,
 			Err:     "unknown_field",
-			Message: fmt.Sprintf("unknown field: %s", e.Key),
+			Message: fmt.Sprintf("unknown field: %s", unknownKeyErr.Key),
 		}
 	}
-
-	// 4. Last resort: infer status from the error message and preserve the
-	// message for 4xx so clients can act on it; hide it for 5xx.
-	msg := err.Error()
-	code := inferStatusCode(msg)
-	out := &HTTPError{Code: code, Err: inferErrorType(code)}
-	if code >= 400 && code < 500 {
-		out.Message = msg
-	}
-	return out
+	return nil
 }
 
 func extractErrorToHTTP(e *ExtractError) *HTTPError {
@@ -1631,6 +2030,13 @@ func extractErrorToHTTP(e *ExtractError) *HTTPError {
 		}
 	case ErrTypeEmptyBody:
 		return &HTTPError{Code: http.StatusBadRequest, Err: "empty_body", Message: e.Message}
+	case ErrTypeJSONDecode:
+		// Keep the detailed stdlib mappings (invalid_json_syntax/_type) when
+		// recognizable; otherwise report a generic decode failure.
+		if h := wellKnownErrorToHTTP(e.Err); h != nil {
+			return h
+		}
+		return &HTTPError{Code: http.StatusBadRequest, Err: "json_decode_error", Message: e.Message}
 	case ErrTypeFormParse:
 		return &HTTPError{Code: http.StatusBadRequest, Err: "invalid_form", Message: e.Message}
 	case ErrTypeFileMissing:
@@ -1641,6 +2047,10 @@ func extractErrorToHTTP(e *ExtractError) *HTTPError {
 		return &HTTPError{Code: http.StatusBadRequest, Err: "missing_path_parameter", Message: e.Message}
 	case ErrTypeValidation:
 		return &HTTPError{Code: http.StatusBadRequest, Err: "validation_failed", Message: e.Message}
+	case "unsupported_type":
+		// A handler/extractor type problem is the server's fault, not the
+		// client's; the message is logged via the 5xx path, not echoed.
+		return &HTTPError{Code: http.StatusInternalServerError, Err: "internal_server_error"}
 	default:
 		return &HTTPError{Code: http.StatusBadRequest, Err: e.Type, Message: e.Message}
 	}
@@ -1649,7 +2059,9 @@ func extractErrorToHTTP(e *ExtractError) *HTTPError {
 func inferStatusCode(msg string) int {
 	lower := strings.ToLower(msg)
 	switch {
-	case strings.Contains(lower, "not found"):
+	case strings.Contains(lower, "not found"),
+		strings.Contains(lower, "does not exist"),
+		strings.Contains(lower, "doesn't exist"):
 		return http.StatusNotFound
 	case strings.Contains(lower, "unauthorized"):
 		return http.StatusUnauthorized
@@ -1657,13 +2069,21 @@ func inferStatusCode(msg string) int {
 		return http.StatusForbidden
 	case strings.Contains(lower, "timeout"):
 		return http.StatusRequestTimeout
-	case strings.Contains(lower, "bad request"), strings.Contains(lower, "invalid"):
+	case strings.Contains(lower, "conflict"),
+		strings.Contains(lower, "already exists"):
+		return http.StatusConflict
+	case strings.Contains(lower, "bad request"),
+		strings.Contains(lower, "invalid"),
+		strings.Contains(lower, "validation"):
 		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError
 	}
 }
 
+// inferErrorType returns a snake_case error tag for a status code. A few
+// historical tags are pinned; everything else derives from http.StatusText
+// (409 → "conflict", 422 → "unprocessable_entity", …).
 func inferErrorType(code int) string {
 	switch code {
 	case http.StatusBadRequest:
@@ -1678,30 +2098,61 @@ func inferErrorType(code int) string {
 		return "timeout"
 	case http.StatusRequestEntityTooLarge:
 		return "body_too_large"
-	default:
+	case http.StatusInternalServerError:
 		return "internal_error"
 	}
+	if code >= 400 {
+		if text := http.StatusText(code); text != "" {
+			return statusTextTag(text)
+		}
+		if code < 500 {
+			return "bad_request"
+		}
+	}
+	return "internal_error"
+}
+
+// statusTextTag converts an http.StatusText value ("Unprocessable Entity")
+// into a snake_case tag ("unprocessable_entity").
+func statusTextTag(text string) string {
+	var b strings.Builder
+	b.Grow(len(text))
+	for _, r := range strings.ToLower(text) {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == ' ' || r == '-':
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 // =============================================================================
 // Pattern parsing
 // =============================================================================
 
+// pathKey is one {name} placeholder parsed from a route pattern.
+type pathKey struct {
+	name     string
+	wildcard bool // true for {name...}
+}
+
 var (
-	patternCache   sync.Map // map[string][]string
+	patternCache   sync.Map // map[string][]pathKey
 	patternWarnMu  sync.Mutex
 	patternWarnSet = map[string]struct{}{}
 )
 
-// patternNames returns the path-parameter names from a Go 1.22+ pattern. The
+// patternKeys returns the path-parameter keys from a Go 1.22+ pattern. The
 // result is cached because the same pattern repeats every request.
-func patternNames(pattern string) []string {
+func patternKeys(pattern string) []pathKey {
 	if v, ok := patternCache.Load(pattern); ok {
-		return v.([]string)
+		return v.([]pathKey)
 	}
-	names := extractPatternNames(pattern)
-	patternCache.Store(pattern, names)
-	return names
+	keys := extractPatternNames(pattern)
+	patternCache.Store(pattern, keys)
+	return keys
 }
 
 func warnPathMismatch(pattern string) {
@@ -1716,11 +2167,11 @@ func warnPathMismatch(pattern string) {
 	}
 }
 
-// extractPatternNames parses a pattern like "GET /users/{id}/posts/{pid}" and
-// returns ["id", "pid"]. The "{$}" end-of-path marker and the "..." catch-all
-// suffix are stripped. Unbalanced braces emit a logger warning.
-func extractPatternNames(pattern string) []string {
-	names := []string{}
+// extractPatternNames parses a pattern like "GET /users/{id}/posts/{p...}"
+// and returns its placeholder keys: [{id false}, {p true}]. The "{$}"
+// end-of-path marker is skipped. Unbalanced braces emit a logger warning.
+func extractPatternNames(pattern string) []pathKey {
+	keys := []pathKey{}
 	inParam := false
 	current := ""
 	depth := 0
@@ -1743,7 +2194,7 @@ func extractPatternNames(pattern string) []string {
 			depth--
 			name := strings.TrimSuffix(current, "...")
 			if name != "" && name != "$" {
-				names = append(names, name)
+				keys = append(keys, pathKey{name: name, wildcard: name != current})
 			}
 		case inParam:
 			current += string(ch)
@@ -1752,5 +2203,5 @@ func extractPatternNames(pattern string) []string {
 	if depth != 0 {
 		logger().Printf("mint: unbalanced braces in pattern %q", pattern)
 	}
-	return names
+	return keys
 }

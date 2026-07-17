@@ -20,7 +20,8 @@ serialization for you — and gets out of the way for everything else.
 go get github.com/cymoo/mint
 ```
 
-Requires **Go 1.23+** (for the enhanced routing patterns in `net/http`).
+Requires **Go 1.25+** (the dependency floor; Mint itself needs the Go
+1.22+ `net/http` routing patterns).
 
 ---
 
@@ -101,10 +102,20 @@ http.HandleFunc(pattern, m.H(yourFunc))
 | `m.Cookie[T]`             | Cookies mapped onto a struct via `cookie` tags |
 | `http.ResponseWriter`     | The raw writer (wrapped, see below)            |
 | `*http.Request`           | The raw request                                |
+| `context.Context`         | `r.Context()` — no need to take the request just for the context |
 | any type implementing `Extractor` | Your own extractor                      |
 
 Mint **panics at registration time** if you use anything else as a
-parameter. Bad handlers blow up at startup, not at request time.
+parameter. Bad handlers blow up at startup, not at request time. The same
+startup checks also reject:
+
+- `Query[T]` / `Form[T]` / `Header[T]` / `Cookie[T]` where `T` is not a
+  struct (or pointer to struct);
+- two `JSON[T]` parameters, or `JSON[T]` combined with `Form[T]`/`File`
+  (the body can only be consumed once — `Form` + `File` together is fine);
+- a custom writer interface that `*mint.ResponseWriter` cannot satisfy
+  (it provides `http.ResponseWriter` plus `Flush`, `Hijack`, `Push`,
+  `Unwrap`, `Status`, `Written`).
 
 ### Allowed return shapes
 
@@ -118,9 +129,9 @@ parameter. Bad handlers blow up at startup, not at request time.
 | `m.StatusCode`               | Empty body with this status                          |
 | `m.HTML`                     | `Content-Type: text/html`                            |
 | `[]byte`                     | `Content-Type: application/octet-stream`             |
-| `io.Reader`                  | Streamed verbatim                                    |
+| `io.Reader`                  | Streamed verbatim (closed after, if `io.Closer`)     |
 | `http.Handler`               | Delegated to                                         |
-| any type implementing `Responder` | Calls `Respond(w, r)`                           |
+| any type implementing `Responder` | Calls `Respond(w)`                              |
 
 Any other concrete type is JSON-encoded. The first value of `(T, error)`
 **cannot** be `Result[U]` — pick one style or the other.
@@ -147,8 +158,11 @@ func createUser(body m.JSON[CreateUser]) (User, error) {
 
 - Body is automatically size-limited (default 5 MiB; configurable).
 - Empty body → `empty_body` error.
-- Malformed JSON → 400 with `Err: "json_decode_error"`.
-- Validation tags are honored.
+- Malformed JSON → 400 with `Err: "invalid_json_syntax"` /
+  `"invalid_json_type"` (or `"json_decode_error"` for failures from a custom
+  `WithJSONUnmarshal` function).
+- Validation tags are honored — for struct bodies. Non-struct bodies
+  (slices, maps, scalars) decode fine and simply skip validation.
 
 ### `Query[T]`
 
@@ -197,6 +211,9 @@ func upload(f m.Form[Upload]) error {
 removes a partial target on failure, and can only be called once. Use
 `FilePart.Open()` if you need to stream the file yourself.
 
+File fields are also found through untagged **embedded** structs (value or
+pointer embeds), mirroring how the schema decoder promotes value fields.
+
 ### `File`
 
 ```go
@@ -206,9 +223,10 @@ func upload(file m.File) error {
 }
 ```
 
-`File` extracts the first uploaded file from a `multipart/form-data` request.
-Use `Form[T]` with `FilePart` fields when you need to bind a specific form
-field name or accept multiple files.
+`File` extracts one uploaded file from a `multipart/form-data` request —
+the first file of the alphabetically-first field name (multipart field
+order is not preserved). Use `Form[T]` with `FilePart` fields when you need
+to bind a specific form field name or accept multiple files.
 
 ### `Path[T]`
 
@@ -220,7 +238,8 @@ mux.HandleFunc("GET /files/{name}", m.H(func(name m.Path[string]) File { ... }))
 ```
 
 Supported types: `string`, `int`, `int8`, `int16`, `int32`, `int64`,
-`uint`–`uint64`, `float32`, `float64`, `bool`.
+`uint`–`uint64`, `uintptr`, `float32`, `float64`, `bool` (and named types
+based on them).
 
 > ⚠️ **Path binding is positional, not by name.** Path params are matched to
 > handler parameters **in order**. For
@@ -238,6 +257,12 @@ Supported types: `string`, `int`, `int8`, `int16`, `int32`, `int64`,
 
 If you declare more `Path[T]` parameters than the route pattern provides,
 Mint returns **400** at request time (and logs a one-time warning).
+
+`{name...}` wildcards bind like any other placeholder (use
+`Path[string]`); an empty remainder — e.g. `GET /files/` against
+`/files/{p...}` — is a legitimate match and yields `""`. This applies to
+`Path[string]` only: a non-string wildcard binding cannot represent an
+empty match and still returns 400.
 
 ### `Header[T]`
 
@@ -358,13 +383,13 @@ Mint converts errors into HTTP responses in this order of priority:
    the `Type` to a code (`body_too_large` → 413, etc.).
 
 3. **Anything else** — Mint inspects the error message to guess a status:
-   - "not found" / "doesn't exist" → 404
-   - "unauthorized" / "auth"        → 401
-   - "forbidden"                    → 403
-   - "timeout"                      → 408
-   - "conflict" / "exists"          → 409
-   - "invalid" / "validation"       → 400
-   - otherwise                      → 500
+   - "not found" / "does not exist" / "doesn't exist" → 404
+   - "unauthorized"                        → 401
+   - "forbidden"                           → 403
+   - "timeout"                             → 408
+   - "conflict" / "already exists"         → 409
+   - "bad request" / "invalid" / "validation" → 400
+   - otherwise                             → 500
 
 ### Visibility rules
 
@@ -376,8 +401,13 @@ Mint converts errors into HTTP responses in this order of priority:
 This way internal errors don't leak to clients, but you still see them
 in logs.
 
+The rule is applied against the **final** status code: with
+`m.Err[T](code, err)`, the `Result.Code` you pass decides whether the
+message is shown (4xx) or hidden and logged (5xx).
+
 > If you want exact control: return `*HTTPError`. Mint will respect both
-> `Err` and `Message` regardless of code.
+> `Err` and `Message` regardless of code (`Result.Code` only overrides
+> the status).
 
 ---
 
@@ -413,8 +443,9 @@ implements:
 - `http.Hijacker` — for protocol upgrades (WebSocket, etc.)
 - `http.Pusher` — for HTTP/2 push
 
-Each delegates to the underlying writer, or returns
-`http.ErrNotSupported` if the underlying server doesn't support it.
+Each delegates to the underlying writer. `Hijack` and `Push` return
+`http.ErrNotSupported` if the underlying server doesn't support them;
+`Flush` (which has no return value) is a safe no-op.
 
 ```go
 func sse(w http.ResponseWriter, r *http.Request) {
@@ -448,6 +479,7 @@ later (e.g. in tests). `Reset` returns everything to defaults.
 | Option                         | Default                                 |
 |--------------------------------|------------------------------------------|
 | `WithMaxRequestBodySize(n)`    | `5 << 20` (5 MiB). Pass `0` to disable. |
+| `WithMultipartMemory(n)`       | `32 << 20` (32 MiB) in-memory budget for multipart parsing |
 | `WithJSONEncode(fn)`           | `json.Encoder` with `SetEscapeHTML(false)` |
 | `WithJSONMarshal(fn)`          | _(unset; falls back to encoder)_         |
 | `WithJSONUnmarshal(fn)`        | `json.Unmarshal`                         |
